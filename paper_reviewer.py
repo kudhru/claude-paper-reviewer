@@ -138,9 +138,9 @@ def run_claude(
         cmd += ["--add-dir"] + extra_dirs
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Claude timed out after 10 minutes on this prompt.")
+        raise RuntimeError("Claude timed out after 20 minutes on this prompt.")
     except FileNotFoundError:
         raise RuntimeError(
             "`claude` not found. Is Claude Code CLI installed and on your PATH?"
