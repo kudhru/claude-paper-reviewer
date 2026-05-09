@@ -342,8 +342,21 @@ def review_single_paper(
             "id": 5,
             "label": f"Conference Review — {conference}",
             "text": (
-                f"Review the paper for {conference}. Suggest a comprehensive revision plan "
-                f"(writing + experiments) for the main track or dataset track of {conference}."
+                f"Review the paper for {conference}. Structure your response in two parts.\n\n"
+                f"**Part 1: Conference-Style Review**\n"
+                f"Write a formal review in the style of a {conference} reviewer with the "
+                f"following four sections:\n"
+                f"1. **Paper Summary** — a concise summary of the paper's contributions, "
+                f"methodology, and findings.\n"
+                f"2. **Strengths** — a bullet list of the paper's main strengths.\n"
+                f"3. **Weaknesses** — a bullet list of the paper's main weaknesses and "
+                f"limitations.\n"
+                f"4. **Overall Recommendation** — your recommendation "
+                f"(Accept / Weak Accept / Weak Reject / Reject) with a brief justification.\n\n"
+                f"**Part 2: Comprehensive Revision Plan**\n"
+                f"Suggest a comprehensive revision plan (writing + experiments) for the main "
+                f"track or dataset track of {conference}, addressing the weaknesses and other "
+                f"issues identified above."
             ),
             "web_search": False,
         },
