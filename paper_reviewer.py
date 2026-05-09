@@ -216,26 +216,18 @@ def review_single_paper(
             ),
             "web_search": False,
         },
-        {
-            "id": 6,
-            "label": "Full Review Compilation",
-            "text": (
-                "Compile all the above reviews into one comprehensive markdown document "
-                "with clear section headings for each review dimension covered above."
-            ),
-            "web_search": False,
-        },
     ]
 
     session_id: Optional[str] = None
-    compiled_text = ""
+    # Collect (label, response) for each step to build the compiled doc at the end.
+    completed: list[tuple[str, str]] = []
 
     for prompt in all_prompts:
         label = prompt["label"]
         pid = prompt["id"]
         web = prompt["web_search"]
 
-        print(f"\n    [{pid}/6]  {label}", end="", flush=True)
+        print(f"\n    [{pid}/5]  {label}", end="", flush=True)
         if web:
             print("  (web search enabled)", end="")
         print(" …", flush=True)
@@ -268,8 +260,7 @@ def review_single_paper(
             print(f"\n    ERROR on prompt {pid}: {exc}", file=sys.stderr)
             response = f"[Review generation failed for this step: {exc}]"
 
-        if pid == 6:
-            compiled_text = response
+        completed.append((label, response))
 
         fname = f"{pid:02d}_{slugify(label)}.md"
         (out_dir / fname).write_text(
@@ -277,8 +268,14 @@ def review_single_paper(
         )
         print(f"    → {fname}")
 
-    # Save and convert compiled review
-    compiled_md = out_dir / "06_full_review.md"
+    # Compile all responses into one document without an extra Claude turn.
+    paper_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
+    sections = [f"# Full Review: {paper_title}\n\n**Conference:** {conference}\n"]
+    for label, response in completed:
+        sections.append(f"---\n\n## {label}\n\n{response}")
+    compiled_text = "\n\n".join(sections) + "\n"
+
+    compiled_md = out_dir / "full_review.md"
     compiled_md.write_text(compiled_text, encoding="utf-8")
 
     pdf_result = try_pdf_convert(compiled_md)
