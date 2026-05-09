@@ -119,9 +119,10 @@ def run_claude(
     model: str = "claude-sonnet-4-6",
     tools: str = TOOLS_READ_ONLY,
     extra_dirs: Optional[list] = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict]:
     """
-    Run `claude -p <prompt>` and return (session_id, response_text).
+    Run `claude -p <prompt>` and return (session_id, response_text, stats).
+    stats keys: duration_ms, input_tokens, output_tokens, cost_usd.
     On subsequent turns pass --resume <session_id> to continue the conversation.
     """
     cmd = [
@@ -163,7 +164,15 @@ def run_claude(
     if data.get("is_error"):
         raise RuntimeError(f"Claude returned an error: {data.get('result', '?')}")
 
-    return data["session_id"], data.get("result", "")
+    usage = data.get("usage", {})
+    stats = {
+        "duration_ms": data.get("duration_ms", 0),
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "cost_usd": data.get("total_cost_usd", 0.0),
+    }
+
+    return data["session_id"], data.get("result", ""), stats
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +229,8 @@ def review_single_paper(
     ]
 
     session_id: Optional[str] = None
-    # Collect (label, response) for each step to build the compiled doc at the end.
-    completed: list[tuple[str, str]] = []
+    # Collect (label, response, stats) for each step to build the compiled doc at the end.
+    completed: list[tuple[str, str, dict]] = []
 
     for prompt in all_prompts:
         label = prompt["label"]
@@ -250,7 +259,7 @@ def review_single_paper(
         tools = TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY
 
         try:
-            session_id, response = run_claude(
+            session_id, response, stats = run_claude(
                 prompt=text,
                 session_id=session_id,
                 model=model,
@@ -260,20 +269,63 @@ def review_single_paper(
         except RuntimeError as exc:
             print(f"\n    ERROR on prompt {pid}: {exc}", file=sys.stderr)
             response = f"[Review generation failed for this step: {exc}]"
+            stats = {"duration_ms": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
 
-        completed.append((label, response))
+        # Print stats to terminal.
+        secs = stats["duration_ms"] / 1000
+        print(
+            f"    time: {secs:.1f}s   "
+            f"tokens in: {stats['input_tokens']:,}   "
+            f"tokens out: {stats['output_tokens']:,}   "
+            f"cost: ${stats['cost_usd']:.4f}"
+        )
 
+        completed.append((label, response, stats))
+
+        stats_block = (
+            f"\n\n---\n"
+            f"*Time: {secs:.1f}s | "
+            f"Tokens in: {stats['input_tokens']:,} | "
+            f"Tokens out: {stats['output_tokens']:,} | "
+            f"Cost: ${stats['cost_usd']:.4f}*"
+        )
         fname = f"{pid:02d}_{slugify(label)}.md"
         (out_dir / fname).write_text(
-            f"# {label}\n\n{response}\n", encoding="utf-8"
+            f"# {label}\n\n{response}{stats_block}\n", encoding="utf-8"
         )
         print(f"    → {fname}")
 
     # Compile all responses into one document without an extra Claude turn.
     paper_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
-    sections = [f"# Full Review: {paper_title}\n\n**Conference:** {conference}\n"]
-    for label, response in completed:
-        sections.append(f"---\n\n## {label}\n\n{response}")
+    total_secs = sum(s["duration_ms"] for _, _, s in completed) / 1000
+    total_in   = sum(s["input_tokens"]  for _, _, s in completed)
+    total_out  = sum(s["output_tokens"] for _, _, s in completed)
+    total_cost = sum(s["cost_usd"]      for _, _, s in completed)
+
+    summary = (
+        f"| Metric | Value |\n"
+        f"|--------|-------|\n"
+        f"| Total time | {total_secs:.1f}s |\n"
+        f"| Total tokens in | {total_in:,} |\n"
+        f"| Total tokens out | {total_out:,} |\n"
+        f"| Total cost | ${total_cost:.4f} |"
+    )
+
+    sections = [
+        f"# Full Review: {paper_title}\n\n"
+        f"**Conference:** {conference}\n\n"
+        f"## Usage Summary\n\n{summary}"
+    ]
+    for label, response, stats in completed:
+        secs = stats["duration_ms"] / 1000
+        stats_block = (
+            f"\n\n---\n"
+            f"*Time: {secs:.1f}s | "
+            f"Tokens in: {stats['input_tokens']:,} | "
+            f"Tokens out: {stats['output_tokens']:,} | "
+            f"Cost: ${stats['cost_usd']:.4f}*"
+        )
+        sections.append(f"---\n\n## {label}\n\n{response}{stats_block}")
     compiled_text = "\n\n".join(sections) + "\n"
 
     compiled_md = out_dir / "full_review.md"
@@ -285,6 +337,12 @@ def review_single_paper(
         print(f"    PDF      : {pdf_result.name}")
     else:
         print("    PDF      : skipped (pandoc not found — brew install pandoc)")
+    print(
+        f"\n    Total — time: {total_secs:.1f}s   "
+        f"tokens in: {total_in:,}   "
+        f"tokens out: {total_out:,}   "
+        f"cost: ${total_cost:.4f}"
+    )
 
 
 # ---------------------------------------------------------------------------
