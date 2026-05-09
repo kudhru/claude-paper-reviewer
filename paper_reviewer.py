@@ -19,6 +19,7 @@ Requirements:
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -343,6 +344,11 @@ def review_single_paper(
         f"tokens out: {total_out:,}   "
         f"cost: ${total_cost:.4f}"
     )
+
+    # Move the source PDF into the review folder so paper and reviews stay together.
+    dest = out_dir / pdf_path.name
+    shutil.move(str(pdf_path), dest)
+    print(f"    Moved   : {pdf_path.name} → {out_dir.name}/")
 
 
 # ---------------------------------------------------------------------------
