@@ -355,8 +355,9 @@ def review_single_paper(
                 f"(Accept / Weak Accept / Weak Reject / Reject) with a brief justification.\n\n"
                 f"**Part 2: Comprehensive Revision Plan**\n"
                 f"Suggest a comprehensive revision plan (writing + experiments) for the main "
-                f"track or dataset track of {conference}, addressing the weaknesses and other "
-                f"issues identified above."
+                f"track or dataset track of {conference}, addressing all issues identified "
+                f"across the reviews above — readability and presentation, consistency and "
+                f"completeness, novelty and related work, and the weaknesses listed in Part 1."
             ),
             "web_search": False,
         },
