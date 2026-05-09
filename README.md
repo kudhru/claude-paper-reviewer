@@ -96,6 +96,52 @@ reviews/
 
 ---
 
+## Running with tmux (recommended)
+
+Each step can take several minutes. If you close your laptop lid, macOS puts the machine to sleep and the script pauses. Running inside a **tmux** session protects against this: when the Mac wakes up, the session is still there and the script continues.
+
+### Install tmux
+
+```bash
+brew install tmux
+```
+
+### Start a review session
+
+```bash
+# Create a named tmux session and start the review inside it
+tmux new -s review
+python paper_reviewer.py --papers-dir ./papers --conference "ACL 2026"
+```
+
+You can now close the lid. When you open it again, reattach to the session:
+
+```bash
+tmux attach -t review
+```
+
+### Useful tmux commands
+
+| Command | What it does |
+|---------|-------------|
+| `tmux new -s review` | Start a new session named `review` |
+| `tmux attach -t review` | Reattach to an existing session |
+| `tmux ls` | List all active sessions |
+| `Ctrl-b d` | Detach from session (leaves it running) |
+| `Ctrl-b [` | Scroll through output (q to quit scroll mode) |
+
+### If the script was killed during sleep
+
+The script saves progress after every step. If the subprocess was killed rather than paused, just re-run the same command and enter `y` when asked to resume:
+
+```
+  Found incomplete review started at 2026-05-09 14:32:11
+  Steps already done: [0, 1, 2]
+  Resume from where it stopped? [y/n]: y
+```
+
+---
+
 ## Notes
 
 - **Web search** is enabled only for step 4 (novelty review). Claude performs live searches to find related work not cited in the paper.
