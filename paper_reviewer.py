@@ -42,7 +42,8 @@ STYLE_INSTRUCTION = (
     "- Do not use em-dashes (—) or en-dashes (–) anywhere.\n"
     "- Do not use semicolons (;) as connectors between clauses.\n"
     "- Do not use colons (:) to introduce a continuation of a sentence.\n"
-    "- Write in plain, direct sentences. Use a period and start a new sentence instead.\n\n"
+    "- Write in plain, direct sentences. Use a period and start a new sentence instead.\n"
+    "- Use Markdown for formatting and LaTeX for any mathematical formulas or expressions.\n\n"
 )
 
 
