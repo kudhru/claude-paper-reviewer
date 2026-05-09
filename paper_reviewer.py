@@ -2,9 +2,12 @@
 """
 paper_reviewer.py — Review academic papers using Claude Code CLI.
 
-Runs 7 sequential prompts in a single persistent Claude session per paper,
+Runs sequential prompts in a single persistent Claude session per paper,
 exactly as you would do manually in the web interface — one prompt at a time,
 waiting for each response before sending the next.
+
+Progress is saved after every step. If the script is interrupted (usage limit,
+network error, crash), re-run it with the same arguments and choose to resume.
 
 Usage:
     python paper_reviewer.py                                      # interactive
@@ -47,10 +50,15 @@ STYLE_INSTRUCTION = (
     "- Use Markdown for formatting and LaTeX for any mathematical formulas or expressions.\n\n"
 )
 
+# ---------------------------------------------------------------------------
+# Keywords that indicate a Claude usage / rate limit was hit.
+# ---------------------------------------------------------------------------
+LIMIT_KEYWORDS = ("usage limit", "rate limit", "quota", "too many requests", "limit reached")
+
 
 # ---------------------------------------------------------------------------
 # Prompt templates  (prompt 0 gets the PDF path prepended at runtime;
-# prompts 1-6 rely on the existing session context)
+# prompts 1+ rely on the existing session context)
 # ---------------------------------------------------------------------------
 PROMPTS = [
     {
@@ -106,8 +114,15 @@ PROMPTS = [
         "web_search": True,
     },
     # Prompt 5 (conference review) is built dynamically with the conference name.
-    # Prompt 6 (compilation) is appended last.
 ]
+
+
+# ---------------------------------------------------------------------------
+# Custom exception for usage / rate limit errors
+# ---------------------------------------------------------------------------
+
+class LimitReachedError(RuntimeError):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +139,7 @@ def run_claude(
     """
     Run `claude -p <prompt>` and return (session_id, response_text, stats).
     stats keys: duration_ms, input_tokens, output_tokens, cost_usd.
-    On subsequent turns pass --resume <session_id> to continue the conversation.
+    Raises LimitReachedError when a usage/rate limit is detected.
     """
     cmd = [
         "claude",
@@ -150,6 +165,9 @@ def run_claude(
         )
 
     if proc.returncode != 0 and not proc.stdout.strip():
+        stderr = proc.stderr.strip().lower()
+        if any(kw in stderr for kw in LIMIT_KEYWORDS):
+            raise LimitReachedError(proc.stderr.strip())
         raise RuntimeError(
             f"Claude CLI exited with code {proc.returncode}.\n"
             f"stderr: {proc.stderr.strip()}"
@@ -163,7 +181,10 @@ def run_claude(
         )
 
     if data.get("is_error"):
-        raise RuntimeError(f"Claude returned an error: {data.get('result', '?')}")
+        msg = data.get("result", "unknown error")
+        if any(kw in msg.lower() for kw in LIMIT_KEYWORDS):
+            raise LimitReachedError(msg)
+        raise RuntimeError(f"Claude returned an error: {msg}")
 
     usage = data.get("usage", {})
     stats = {
@@ -174,6 +195,22 @@ def run_claude(
     }
 
     return data["session_id"], data.get("result", ""), stats
+
+
+# ---------------------------------------------------------------------------
+# State management (saves progress after every step for safe resume)
+# ---------------------------------------------------------------------------
+
+def _state_path(reviews_dir: Path, paper_stem: str) -> Path:
+    return reviews_dir / f"{paper_stem}_in_progress.json"
+
+
+def _save_state(state_file: Path, state: dict) -> None:
+    state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _load_state(state_file: Path) -> dict:
+    return json.loads(state_file.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -203,101 +240,14 @@ def try_pdf_convert(md_path: Path) -> Optional[Path]:
     return None
 
 
-def review_single_paper(
-    pdf_path: Path,
+def _compile_and_save(
+    out_dir: Path,
+    paper_stem: str,
     conference: str,
-    reviews_dir: Path,
-    model: str,
-) -> None:
-    """Run the full 7-prompt review pipeline for one paper."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = reviews_dir / f"{pdf_path.stem}_{ts}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  Output → {out_dir}")
-
-    # Build the complete ordered prompt list for this paper/conference
-    abs_pdf = pdf_path.resolve()
-    all_prompts = list(PROMPTS) + [
-        {
-            "id": 5,
-            "label": f"Conference Review — {conference}",
-            "text": (
-                f"Review the paper for {conference}. Suggest a comprehensive revision plan "
-                f"(writing + experiments) for the main track or dataset track of {conference}."
-            ),
-            "web_search": False,
-        },
-    ]
-
-    session_id: Optional[str] = None
-    # Collect (label, response, stats) for each step to build the compiled doc at the end.
-    completed: list[tuple[str, str, dict]] = []
-
-    for prompt in all_prompts:
-        label = prompt["label"]
-        pid = prompt["id"]
-        web = prompt["web_search"]
-
-        print(f"\n    [{pid}/5]  {label}", end="", flush=True)
-        if web:
-            print("  (web search enabled)", end="")
-        print(" …", flush=True)
-
-        # On the very first turn, prepend style rules and instructions to read the PDF.
-        if pid == 0:
-            text = (
-                STYLE_INSTRUCTION
-                + f"I have a research paper for you to review. "
-                f"Please read the full paper at this path:\n{abs_pdf}\n\n"
-                f"After reading it carefully, do the following:\n\n"
-                + prompt["text"]
-            )
-            extra_dirs = [str(abs_pdf.parent)]
-        else:
-            text = prompt["text"]
-            extra_dirs = None
-
-        tools = TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY
-
-        try:
-            session_id, response, stats = run_claude(
-                prompt=text,
-                session_id=session_id,
-                model=model,
-                tools=tools,
-                extra_dirs=extra_dirs,
-            )
-        except RuntimeError as exc:
-            print(f"\n    ERROR on prompt {pid}: {exc}", file=sys.stderr)
-            response = f"[Review generation failed for this step: {exc}]"
-            stats = {"duration_ms": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-
-        # Print stats to terminal.
-        secs = stats["duration_ms"] / 1000
-        print(
-            f"    time: {secs:.1f}s   "
-            f"tokens in: {stats['input_tokens']:,}   "
-            f"tokens out: {stats['output_tokens']:,}   "
-            f"cost: ${stats['cost_usd']:.4f}"
-        )
-
-        completed.append((label, response, stats))
-
-        stats_block = (
-            f"\n\n---\n"
-            f"*Time: {secs:.1f}s | "
-            f"Tokens in: {stats['input_tokens']:,} | "
-            f"Tokens out: {stats['output_tokens']:,} | "
-            f"Cost: ${stats['cost_usd']:.4f}*"
-        )
-        fname = f"{pid:02d}_{slugify(label)}.md"
-        (out_dir / fname).write_text(
-            f"# {label}\n\n{response}{stats_block}\n", encoding="utf-8"
-        )
-        print(f"    → {fname}")
-
-    # Compile all responses into one document without an extra Claude turn.
-    paper_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
+    completed: list[tuple[str, str, dict]],
+) -> Path:
+    """Assemble all step responses into full_review.md and return its path."""
+    paper_title = paper_stem.replace("_", " ").replace("-", " ").title()
     total_secs = sum(s["duration_ms"] for _, _, s in completed) / 1000
     total_in   = sum(s["input_tokens"]  for _, _, s in completed)
     total_out  = sum(s["output_tokens"] for _, _, s in completed)
@@ -327,10 +277,194 @@ def review_single_paper(
             f"Cost: ${stats['cost_usd']:.4f}*"
         )
         sections.append(f"---\n\n## {label}\n\n{response}{stats_block}")
-    compiled_text = "\n\n".join(sections) + "\n"
 
     compiled_md = out_dir / "full_review.md"
-    compiled_md.write_text(compiled_text, encoding="utf-8")
+    compiled_md.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
+    return compiled_md
+
+
+def review_single_paper(
+    pdf_path: Path,
+    conference: str,
+    reviews_dir: Path,
+    model: str,
+) -> None:
+    """Run the full review pipeline for one paper, with save/resume support."""
+    state_file = _state_path(reviews_dir, pdf_path.stem)
+
+    # ----- Check for an existing in-progress review and offer to resume -----
+    session_id: Optional[str] = None
+    completed: list[tuple[str, str, dict]] = []
+    completed_ids: set[int] = set()
+    out_dir: Optional[Path] = None
+
+    if state_file.exists():
+        state = _load_state(state_file)
+        done_steps = [s["id"] for s in state["completed"]]
+        print(f"\n  Found incomplete review started at {state['started_at']}")
+        print(f"  Steps already done: {done_steps}")
+        choice = input("  Resume from where it stopped? [y/n]: ").strip().lower()
+        if choice in ("y", "yes"):
+            out_dir      = Path(state["out_dir"])
+            session_id   = state["session_id"]
+            conference   = state["conference"]
+            model        = state["model"]
+            completed    = [(s["label"], s["response"], s["stats"])
+                            for s in state["completed"]]
+            completed_ids = {s["id"] for s in state["completed"]}
+            print(f"  Resuming — next step: {max(completed_ids) + 1}")
+        else:
+            state_file.unlink()
+            print("  Starting fresh.")
+
+    # ----- Fresh start: create output directory and initial state -----------
+    if out_dir is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = reviews_dir / f"{pdf_path.stem}_{ts}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _save_state(state_file, {
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "paper_stem": pdf_path.stem,
+            "abs_pdf": str(pdf_path.resolve()),
+            "conference": conference,
+            "model": model,
+            "out_dir": str(out_dir),
+            "session_id": None,
+            "completed": [],
+        })
+
+    print(f"  Output → {out_dir}")
+    abs_pdf = Path(_load_state(state_file)["abs_pdf"])
+
+    # ----- Build prompt list ------------------------------------------------
+    all_prompts = list(PROMPTS) + [
+        {
+            "id": 5,
+            "label": f"Conference Review — {conference}",
+            "text": (
+                f"Review the paper for {conference}. Suggest a comprehensive revision plan "
+                f"(writing + experiments) for the main track or dataset track of {conference}."
+            ),
+            "web_search": False,
+        },
+    ]
+
+    # ----- Run each prompt --------------------------------------------------
+    for prompt in all_prompts:
+        pid   = prompt["id"]
+        label = prompt["label"]
+        web   = prompt["web_search"]
+
+        if pid in completed_ids:
+            print(f"\n    [{pid}/5]  {label}  ✓ already done, skipping")
+            continue
+
+        print(f"\n    [{pid}/5]  {label}", end="", flush=True)
+        if web:
+            print("  (web search enabled)", end="")
+        print(" …", flush=True)
+
+        if pid == 0:
+            text = (
+                STYLE_INSTRUCTION
+                + f"I have a research paper for you to review. "
+                f"Please read the full paper at this path:\n{abs_pdf}\n\n"
+                f"After reading it carefully, do the following:\n\n"
+                + prompt["text"]
+            )
+            extra_dirs = [str(abs_pdf.parent)]
+        else:
+            text      = prompt["text"]
+            extra_dirs = None
+
+        tools = TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY
+
+        try:
+            session_id, response, stats = run_claude(
+                prompt=text,
+                session_id=session_id,
+                model=model,
+                tools=tools,
+                extra_dirs=extra_dirs,
+            )
+        except LimitReachedError as exc:
+            # Save progress and exit clearly so the user knows to resume later.
+            _save_state(state_file, {
+                **_load_state(state_file),
+                "session_id": session_id,
+                "completed": [
+                    {"id": i, "label": l, "response": r, "stats": s}
+                    for i, (l, r, s) in enumerate(completed)
+                ],
+            })
+            print(f"\n\n  *** Usage limit reached on step {pid} ***", file=sys.stderr)
+            print(f"  Error: {exc}", file=sys.stderr)
+            print(
+                f"\n  Progress saved. Once your limit resets, re-run the same command\n"
+                f"  and choose 'y' when asked to resume.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except RuntimeError as exc:
+            # Non-limit error: save progress and exit.
+            _save_state(state_file, {
+                **_load_state(state_file),
+                "session_id": session_id,
+                "completed": [
+                    {"id": i, "label": l, "response": r, "stats": s}
+                    for i, (l, r, s) in enumerate(completed)
+                ],
+            })
+            print(f"\n    ERROR on step {pid}: {exc}", file=sys.stderr)
+            print(
+                f"\n  Progress saved. Fix the issue and re-run with the same command\n"
+                f"  to resume from step {pid}.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Step succeeded — print stats and save individual file.
+        secs = stats["duration_ms"] / 1000
+        print(
+            f"    time: {secs:.1f}s   "
+            f"tokens in: {stats['input_tokens']:,}   "
+            f"tokens out: {stats['output_tokens']:,}   "
+            f"cost: ${stats['cost_usd']:.4f}"
+        )
+
+        completed.append((label, response, stats))
+        completed_ids.add(pid)
+
+        stats_block = (
+            f"\n\n---\n"
+            f"*Time: {secs:.1f}s | "
+            f"Tokens in: {stats['input_tokens']:,} | "
+            f"Tokens out: {stats['output_tokens']:,} | "
+            f"Cost: ${stats['cost_usd']:.4f}*"
+        )
+        fname = f"{pid:02d}_{slugify(label)}.md"
+        (out_dir / fname).write_text(
+            f"# {label}\n\n{response}{stats_block}\n", encoding="utf-8"
+        )
+        print(f"    → {fname}")
+
+        # Persist state after every successful step.
+        _save_state(state_file, {
+            **_load_state(state_file),
+            "session_id": session_id,
+            "completed": [
+                {"id": all_prompts[i]["id"], "label": l, "response": r, "stats": s}
+                for i, (l, r, s) in enumerate(completed)
+            ],
+        })
+
+    # ----- All steps done: compile, convert, move PDF, clean up state -------
+    total_secs = sum(s["duration_ms"] for _, _, s in completed) / 1000
+    total_in   = sum(s["input_tokens"]  for _, _, s in completed)
+    total_out  = sum(s["output_tokens"] for _, _, s in completed)
+    total_cost = sum(s["cost_usd"]      for _, _, s in completed)
+
+    compiled_md = _compile_and_save(out_dir, pdf_path.stem, conference, completed)
 
     pdf_result = try_pdf_convert(compiled_md)
     print(f"\n    Markdown : {compiled_md.name}")
@@ -346,9 +480,12 @@ def review_single_paper(
     )
 
     # Move the source PDF into the review folder so paper and reviews stay together.
-    dest = out_dir / pdf_path.name
-    shutil.move(str(pdf_path), dest)
-    print(f"    Moved   : {pdf_path.name} → {out_dir.name}/")
+    if pdf_path.exists():
+        shutil.move(str(pdf_path), out_dir / pdf_path.name)
+        print(f"    Moved   : {pdf_path.name} → {out_dir.name}/")
+
+    # Remove the state file — review is complete.
+    state_file.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
