@@ -8,7 +8,13 @@ Changes vs paper_reviewer.py:
   - Step 4 (novelty/web search) runs in an independent session so raw web
     page content is never carried into the context for step 5. Only step 4's
     synthesized text response is injected into the step 5 prompt.
-  - Main chain: steps 0 -> 2 -> 3 -> 5 share a single persistent session.
+  - Steps 0, 1, and 4 run in parallel (Phase 1). Step 2 starts as soon as
+    step 0 finishes; step 5 starts when both step 3 and step 4 are done.
+
+Execution schedule:
+  Phase 1 (parallel)  : steps 0, 1, 4
+  Phase 2 (sequential): step 2 (resumes step 0 session) -> step 3
+  Phase 3             : step 5 (resumes step 3 session, injects step 4 synthesis)
 
 Usage:
     python paper_reviewer_v2.py                                      # interactive
@@ -26,21 +32,16 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 
-# ---------------------------------------------------------------------------
-# Tools allowed for each turn.
-# ---------------------------------------------------------------------------
 TOOLS_READ_ONLY = "Read,WebFetch"
 TOOLS_WEB_SEARCH = "Read,WebFetch,WebSearch,mcp__web-search-prime__web_search_prime"
 
-# ---------------------------------------------------------------------------
-# Style instruction — prepended to the first prompt of every session
-# (main chain step 0, and each independent step).
-# ---------------------------------------------------------------------------
 STYLE_INSTRUCTION = (
     "Important style rules that apply to every response you give in this conversation:\n"
     "- Do not use em-dashes (—) or en-dashes (–) anywhere.\n"
@@ -52,13 +53,9 @@ STYLE_INSTRUCTION = (
 
 LIMIT_KEYWORDS = ("usage limit", "rate limit", "quota", "too many requests", "limit reached")
 
-
-# ---------------------------------------------------------------------------
-# Prompt templates.
-# independent=True  ->  step runs in a fresh session; its session_id is
-#                       discarded and does NOT advance the main chain.
-# independent=False ->  step resumes the main chain session.
-# ---------------------------------------------------------------------------
+# Step definitions.
+# independent=True  -> runs in its own fresh session; session_id discarded.
+# independent=False -> resumes the main chain session.
 PROMPTS = [
     {
         "id": 0,
@@ -69,7 +66,7 @@ PROMPTS = [
             "conference or journal organizers. Flag any such things."
         ),
         "web_search": False,
-        "independent": False,
+        "independent": False,  # main chain start
     },
     {
         "id": 1,
@@ -79,7 +76,7 @@ PROMPTS = [
             "for the proposed components in the paper."
         ),
         "web_search": False,
-        "independent": True,   # long output — isolated so it does not inflate steps 2-5 context
+        "independent": True,   # isolated: long output excluded from review chain
     },
     {
         "id": 2,
@@ -115,15 +112,11 @@ PROMPTS = [
             "highly related to this work."
         ),
         "web_search": True,
-        "independent": True,   # raw web content isolated — only synthesis injected into step 5
+        "independent": True,   # isolated: raw web content excluded from step 5 context
     },
-    # Step 5 (conference review) is built dynamically with the conference name.
+    # Step 5 is built dynamically with the conference name.
 ]
 
-
-# ---------------------------------------------------------------------------
-# Custom exception for usage / rate limit errors
-# ---------------------------------------------------------------------------
 
 class LimitReachedError(RuntimeError):
     pass
@@ -140,11 +133,7 @@ def run_claude(
     tools: str = TOOLS_READ_ONLY,
     extra_dirs: Optional[list] = None,
 ) -> tuple[str, str, dict]:
-    """
-    Run `claude -p <prompt>` and return (session_id, response_text, stats).
-    stats keys: duration_ms, input_tokens, output_tokens, cost_usd.
-    Raises LimitReachedError when a usage/rate limit is detected.
-    """
+    """Run `claude -p <prompt>` and return (session_id, response_text, stats)."""
     cmd = [
         "claude",
         "-p", prompt,
@@ -152,10 +141,8 @@ def run_claude(
         "--model", model,
         "--allowedTools", tools,
     ]
-
     if session_id:
         cmd += ["--resume", session_id]
-
     if extra_dirs:
         cmd += ["--add-dir"] + extra_dirs
 
@@ -197,7 +184,6 @@ def run_claude(
         "output_tokens": usage.get("output_tokens", 0),
         "cost_usd": data.get("total_cost_usd", 0.0),
     }
-
     return data["session_id"], data.get("result", ""), stats
 
 
@@ -218,7 +204,7 @@ def _load_state(state_file: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Single-paper review pipeline
+# Helpers
 # ---------------------------------------------------------------------------
 
 def slugify(text: str) -> str:
@@ -248,14 +234,16 @@ def _compile_and_save(
     out_dir: Path,
     paper_stem: str,
     conference: str,
-    completed: list[tuple[str, str, dict]],
+    step_results: dict,   # {pid: (label, response, stats)}
 ) -> Path:
-    """Assemble all step responses into full_review.md and return its path."""
+    """Assemble all step responses into full_review.md (in step-id order)."""
+    ordered = [step_results[pid] for pid in sorted(step_results)]
     paper_title = paper_stem.replace("_", " ").replace("-", " ").title()
-    total_secs = sum(s["duration_ms"] for _, _, s in completed) / 1000
-    total_in   = sum(s["input_tokens"]  for _, _, s in completed)
-    total_out  = sum(s["output_tokens"] for _, _, s in completed)
-    total_cost = sum(s["cost_usd"]      for _, _, s in completed)
+
+    total_secs = sum(s["duration_ms"] for _, _, s in ordered) / 1000
+    total_in   = sum(s["input_tokens"]  for _, _, s in ordered)
+    total_out  = sum(s["output_tokens"] for _, _, s in ordered)
+    total_cost = sum(s["cost_usd"]      for _, _, s in ordered)
 
     summary = (
         f"| Metric | Value |\n"
@@ -271,7 +259,7 @@ def _compile_and_save(
         f"**Conference:** {conference}\n\n"
         f"## Usage Summary\n\n{summary}"
     ]
-    for label, response, stats in completed:
+    for label, response, stats in ordered:
         secs = stats["duration_ms"] / 1000
         stats_block = (
             f"\n\n---\n"
@@ -287,6 +275,39 @@ def _compile_and_save(
     return compiled_md
 
 
+def _save_step_file(out_dir: Path, pid: int, label: str, response: str, stats: dict) -> str:
+    secs = stats["duration_ms"] / 1000
+    stats_block = (
+        f"\n\n---\n"
+        f"*Time: {secs:.1f}s | "
+        f"Tokens in: {stats['input_tokens']:,} | "
+        f"Tokens out: {stats['output_tokens']:,} | "
+        f"Cost: ${stats['cost_usd']:.4f}*"
+    )
+    fname = f"{pid:02d}_{slugify(label)}.md"
+    (out_dir / fname).write_text(f"# {label}\n\n{response}{stats_block}\n", encoding="utf-8")
+    return fname
+
+
+def _serialise_results(step_results: dict, all_prompts: list) -> list:
+    """Convert step_results dict to the list format used in the state file."""
+    id_to_prompt = {p["id"]: p for p in all_prompts}
+    return [
+        {
+            "id": pid,
+            "label": label,
+            "response": resp,
+            "stats": stats,
+        }
+        for pid, (label, resp, stats) in sorted(step_results.items())
+        if pid in id_to_prompt
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Single-paper review pipeline
+# ---------------------------------------------------------------------------
+
 def review_single_paper(
     pdf_path: Path,
     conference: str,
@@ -297,10 +318,10 @@ def review_single_paper(
     state_file = _state_path(reviews_dir, pdf_path.stem)
 
     main_session_id: Optional[str] = None
-    completed: list[tuple[str, str, dict]] = []
-    completed_ids: set[int] = set()
+    step_results: dict[int, tuple[str, str, dict]] = {}  # {pid: (label, resp, stats)}
     out_dir: Optional[Path] = None
 
+    # ----- Resume check -----
     if state_file.exists():
         state = _load_state(state_file)
         done_steps = [s["id"] for s in state["completed"]]
@@ -312,10 +333,11 @@ def review_single_paper(
             main_session_id = state["session_id"]
             conference      = state["conference"]
             model           = state["model"]
-            completed       = [(s["label"], s["response"], s["stats"])
-                               for s in state["completed"]]
-            completed_ids   = {s["id"] for s in state["completed"]}
-            print(f"  Resuming — next step: {max(completed_ids) + 1}")
+            step_results    = {
+                s["id"]: (s["label"], s["response"], s["stats"])
+                for s in state["completed"]
+            }
+            print(f"  Resuming — completed: {sorted(step_results.keys())}")
         else:
             state_file.unlink()
             print("  Starting fresh.")
@@ -342,116 +364,149 @@ def review_single_paper(
         {
             "id": 5,
             "label": f"Conference Review — {conference}",
-            "text": None,  # built at runtime to include step 4 synthesis
+            "text": None,  # built at runtime
             "web_search": False,
             "independent": False,
         },
     ]
 
-    for prompt in all_prompts:
-        pid         = prompt["id"]
-        label       = prompt["label"]
-        web         = prompt["web_search"]
-        independent = prompt.get("independent", False)
+    done = set(step_results.keys())
+    print_lock = threading.Lock()
 
-        if pid in completed_ids:
+    # -------------------------------------------------------------------
+    # Phase 1: run steps 0, 1, 4 in parallel
+    # -------------------------------------------------------------------
+    phase1_defs = [p for p in all_prompts if p["id"] in {0, 1, 4} and p["id"] not in done]
+
+    if phase1_defs:
+        pids_str = ", ".join(str(p["id"]) for p in phase1_defs)
+        print(f"\n  Phase 1 — running steps [{pids_str}] in parallel …")
+
+        def _run_phase1_step(step):
+            pid = step["id"]
+            web = step["web_search"]
+            ind = step.get("independent", False)
+
+            # All phase 1 steps need to read the paper from scratch.
+            intro = (
+                f"I have a research paper for you to review. "
+                f"Please read the full paper at this path:\n{abs_pdf}\n\n"
+                f"After reading it carefully, do the following:\n\n"
+                if pid == 0
+                else
+                f"I have a research paper. Please read the full paper at this path:\n"
+                f"{abs_pdf}\n\n"
+                f"After reading it carefully, do the following:\n\n"
+            )
+            text = STYLE_INSTRUCTION + intro + step["text"]
+
+            tags = []
+            if web: tags.append("web search")
+            if ind: tags.append("independent session")
+            tag_str = f"  ({', '.join(tags)})" if tags else ""
+
+            with print_lock:
+                print(f"    [{pid}/5]  {step['label']}{tag_str} … started", flush=True)
+
+            sid, resp, stats = run_claude(
+                prompt=text,
+                session_id=None,
+                model=model,
+                tools=TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY,
+                extra_dirs=[str(abs_pdf.parent)],
+            )
+            secs = stats["duration_ms"] / 1000
+            with print_lock:
+                print(
+                    f"    [{pid}/5]  {step['label']} ✓  "
+                    f"time: {secs:.1f}s   "
+                    f"tokens in: {stats['input_tokens']:,}   "
+                    f"tokens out: {stats['output_tokens']:,}   "
+                    f"cost: ${stats['cost_usd']:.4f}"
+                )
+            return pid, sid, resp, stats
+
+        phase1_ok: dict[int, tuple] = {}
+        phase1_err: dict[int, Exception] = {}
+
+        with ThreadPoolExecutor(max_workers=len(phase1_defs)) as executor:
+            futures = {executor.submit(_run_phase1_step, step): step["id"] for step in phase1_defs}
+            for future in as_completed(futures):
+                pid = futures[future]
+                try:
+                    pid, sid, resp, stats = future.result()
+                    phase1_ok[pid] = (sid, resp, stats)
+                except (LimitReachedError, RuntimeError) as exc:
+                    phase1_err[pid] = exc
+
+        # Save successful phase 1 results in step-id order.
+        for step in sorted(phase1_defs, key=lambda p: p["id"]):
+            pid = step["id"]
+            if pid not in phase1_ok:
+                continue
+            sid, resp, stats = phase1_ok[pid]
+            if pid == 0:
+                main_session_id = sid  # only step 0 advances the main chain
+            step_results[pid] = (step["label"], resp, stats)
+            done.add(pid)
+            fname = _save_step_file(out_dir, pid, step["label"], resp, stats)
+            print(f"    → {fname}")
+
+        if phase1_ok:
+            _save_state(state_file, {
+                **_load_state(state_file),
+                "session_id": main_session_id,
+                "completed": _serialise_results(step_results, all_prompts),
+            })
+
+        if phase1_err:
+            first_pid = min(phase1_err.keys())
+            exc = phase1_err[first_pid]
+            step_label = next(p["label"] for p in phase1_defs if p["id"] == first_pid)
+            if isinstance(exc, LimitReachedError):
+                print(f"\n\n  *** Usage limit reached on step {first_pid} ({step_label}) ***", file=sys.stderr)
+                print(f"  Error: {exc}", file=sys.stderr)
+                print(
+                    f"\n  Progress saved. Once your limit resets, re-run the same command\n"
+                    f"  and choose 'y' when asked to resume.\n",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"\n    ERROR on step {first_pid} ({step_label}): {exc}", file=sys.stderr)
+                print(
+                    f"\n  Progress saved. Fix the issue and re-run with the same command\n"
+                    f"  to resume from step {first_pid}.\n",
+                    file=sys.stderr,
+                )
+            sys.exit(1)
+
+    # -------------------------------------------------------------------
+    # Phase 2: steps 2 and 3 — sequential, resuming the main chain
+    # -------------------------------------------------------------------
+    print(f"\n  Phase 2 — running steps [2, 3] sequentially …")
+
+    for step in [p for p in all_prompts if p["id"] in {2, 3}]:
+        pid   = step["id"]
+        label = step["label"]
+
+        if pid in done:
             print(f"\n    [{pid}/5]  {label}  ✓ already done, skipping")
             continue
 
-        print(f"\n    [{pid}/5]  {label}", end="", flush=True)
-        if web:
-            print("  (web search enabled)", end="")
-        if independent:
-            print("  (independent session)", end="")
-        print(" …", flush=True)
-
-        # --- Build prompt text and decide which session to use ---
-
-        if pid == 0:
-            # Kick off the main chain: style rules + paper path + task.
-            text = (
-                STYLE_INSTRUCTION
-                + f"I have a research paper for you to review. "
-                f"Please read the full paper at this path:\n{abs_pdf}\n\n"
-                f"After reading it carefully, do the following:\n\n"
-                + prompt["text"]
-            )
-            session_to_use = None
-            extra_dirs = [str(abs_pdf.parent)]
-
-        elif independent:
-            # Independent steps start a fresh session with their own style rules + paper.
-            text = (
-                STYLE_INSTRUCTION
-                + f"I have a research paper. Please read the full paper at this path:\n"
-                f"{abs_pdf}\n\n"
-                f"After reading it carefully, do the following:\n\n"
-                + prompt["text"]
-            )
-            session_to_use = None   # fresh — does NOT resume the main chain
-            extra_dirs = [str(abs_pdf.parent)]
-
-        elif pid == 5:
-            # Step 5: inject step 4 synthesis as a quoted block; resume the main chain.
-            step4_synthesis = next(
-                (r for lbl, r, _ in completed if "Novelty" in lbl), ""
-            )
-            novelty_block = (
-                "The following is a synthesis from a dedicated novelty and related work "
-                "review conducted separately for this paper. Use it when preparing the "
-                "revision plan.\n\n"
-                "--- Begin Novelty Review ---\n"
-                f"{step4_synthesis}\n"
-                "--- End Novelty Review ---\n\n"
-            ) if step4_synthesis else ""
-
-            text = (
-                novelty_block
-                + f"Review the paper for {conference}. Structure your response in two parts.\n\n"
-                f"**Part 1: Conference-Style Review**\n"
-                f"Write a formal review in the style of a {conference} reviewer with the "
-                f"following four sections:\n"
-                f"1. **Paper Summary** — a concise summary of the paper's contributions, "
-                f"methodology, and findings.\n"
-                f"2. **Strengths** — a bullet list of the paper's main strengths.\n"
-                f"3. **Weaknesses** — a bullet list of the paper's main weaknesses and "
-                f"limitations.\n"
-                f"4. **Overall Recommendation** — your recommendation "
-                f"(Accept / Weak Accept / Weak Reject / Reject) with a brief justification.\n\n"
-                f"**Part 2: Comprehensive Revision Plan**\n"
-                f"Suggest a comprehensive revision plan (writing + experiments) for the main "
-                f"track or dataset track of {conference}, addressing all issues identified "
-                f"across the reviews above — readability and presentation, consistency and "
-                f"completeness, novelty and related work (see the novelty review above), "
-                f"and the weaknesses listed in Part 1."
-            )
-            session_to_use = main_session_id
-            extra_dirs = None
-
-        else:
-            # Normal main-chain step: resume the shared session.
-            text = prompt["text"]
-            session_to_use = main_session_id
-            extra_dirs = None
-
-        tools = TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY
+        print(f"\n    [{pid}/5]  {label} …", flush=True)
 
         try:
-            returned_session_id, response, stats = run_claude(
-                prompt=text,
-                session_id=session_to_use,
+            new_sid, response, stats = run_claude(
+                prompt=step["text"],
+                session_id=main_session_id,
                 model=model,
-                tools=tools,
-                extra_dirs=extra_dirs,
+                tools=TOOLS_READ_ONLY,
             )
         except LimitReachedError as exc:
             _save_state(state_file, {
                 **_load_state(state_file),
                 "session_id": main_session_id,
-                "completed": [
-                    {"id": all_prompts[i]["id"], "label": l, "response": r, "stats": s}
-                    for i, (l, r, s) in enumerate(completed)
-                ],
+                "completed": _serialise_results(step_results, all_prompts),
             })
             print(f"\n\n  *** Usage limit reached on step {pid} ***", file=sys.stderr)
             print(f"  Error: {exc}", file=sys.stderr)
@@ -465,10 +520,7 @@ def review_single_paper(
             _save_state(state_file, {
                 **_load_state(state_file),
                 "session_id": main_session_id,
-                "completed": [
-                    {"id": all_prompts[i]["id"], "label": l, "response": r, "stats": s}
-                    for i, (l, r, s) in enumerate(completed)
-                ],
+                "completed": _serialise_results(step_results, all_prompts),
             })
             print(f"\n    ERROR on step {pid}: {exc}", file=sys.stderr)
             print(
@@ -478,10 +530,7 @@ def review_single_paper(
             )
             sys.exit(1)
 
-        # Advance the main chain session only for non-independent steps.
-        if not independent:
-            main_session_id = returned_session_id
-
+        main_session_id = new_sid
         secs = stats["duration_ms"] / 1000
         print(
             f"    time: {secs:.1f}s   "
@@ -489,39 +538,124 @@ def review_single_paper(
             f"tokens out: {stats['output_tokens']:,}   "
             f"cost: ${stats['cost_usd']:.4f}"
         )
-
-        completed.append((label, response, stats))
-        completed_ids.add(pid)
-
-        stats_block = (
-            f"\n\n---\n"
-            f"*Time: {secs:.1f}s | "
-            f"Tokens in: {stats['input_tokens']:,} | "
-            f"Tokens out: {stats['output_tokens']:,} | "
-            f"Cost: ${stats['cost_usd']:.4f}*"
-        )
-        fname = f"{pid:02d}_{slugify(label)}.md"
-        (out_dir / fname).write_text(
-            f"# {label}\n\n{response}{stats_block}\n", encoding="utf-8"
-        )
+        step_results[pid] = (label, response, stats)
+        done.add(pid)
+        fname = _save_step_file(out_dir, pid, label, response, stats)
         print(f"    → {fname}")
 
         _save_state(state_file, {
             **_load_state(state_file),
             "session_id": main_session_id,
-            "completed": [
-                {"id": all_prompts[i]["id"], "label": l, "response": r, "stats": s}
-                for i, (l, r, s) in enumerate(completed)
-            ],
+            "completed": _serialise_results(step_results, all_prompts),
         })
 
-    # --- All steps done: compile, convert, move PDF, clean up state ---
-    total_secs = sum(s["duration_ms"] for _, _, s in completed) / 1000
-    total_in   = sum(s["input_tokens"]  for _, _, s in completed)
-    total_out  = sum(s["output_tokens"] for _, _, s in completed)
-    total_cost = sum(s["cost_usd"]      for _, _, s in completed)
+    # -------------------------------------------------------------------
+    # Phase 3: step 5 — inject step 4 synthesis, resume main chain
+    # -------------------------------------------------------------------
+    print(f"\n  Phase 3 — running step [5] …")
 
-    compiled_md = _compile_and_save(out_dir, pdf_path.stem, conference, completed)
+    step5_def = next(p for p in all_prompts if p["id"] == 5)
+
+    if 5 not in done:
+        step4_synthesis = step_results.get(4, (None, "", None))[1]
+        novelty_block = (
+            "The following is a synthesis from a dedicated novelty and related work "
+            "review conducted separately for this paper. Use it when preparing the "
+            "revision plan.\n\n"
+            "--- Begin Novelty Review ---\n"
+            f"{step4_synthesis}\n"
+            "--- End Novelty Review ---\n\n"
+        ) if step4_synthesis else ""
+
+        step5_text = (
+            novelty_block
+            + f"Review the paper for {conference}. Structure your response in two parts.\n\n"
+            f"**Part 1: Conference-Style Review**\n"
+            f"Write a formal review in the style of a {conference} reviewer with the "
+            f"following four sections:\n"
+            f"1. **Paper Summary** — a concise summary of the paper's contributions, "
+            f"methodology, and findings.\n"
+            f"2. **Strengths** — a bullet list of the paper's main strengths.\n"
+            f"3. **Weaknesses** — a bullet list of the paper's main weaknesses and "
+            f"limitations.\n"
+            f"4. **Overall Recommendation** — your recommendation "
+            f"(Accept / Weak Accept / Weak Reject / Reject) with a brief justification.\n\n"
+            f"**Part 2: Comprehensive Revision Plan**\n"
+            f"Suggest a comprehensive revision plan (writing + experiments) for the main "
+            f"track or dataset track of {conference}, addressing all issues identified "
+            f"across the reviews above — readability and presentation, consistency and "
+            f"completeness, novelty and related work (see the novelty review above), "
+            f"and the weaknesses listed in Part 1."
+        )
+
+        label = step5_def["label"]
+        print(f"\n    [5/5]  {label} …", flush=True)
+
+        try:
+            new_sid, response, stats = run_claude(
+                prompt=step5_text,
+                session_id=main_session_id,
+                model=model,
+                tools=TOOLS_READ_ONLY,
+            )
+        except LimitReachedError as exc:
+            _save_state(state_file, {
+                **_load_state(state_file),
+                "session_id": main_session_id,
+                "completed": _serialise_results(step_results, all_prompts),
+            })
+            print(f"\n\n  *** Usage limit reached on step 5 ***", file=sys.stderr)
+            print(f"  Error: {exc}", file=sys.stderr)
+            print(
+                f"\n  Progress saved. Once your limit resets, re-run the same command\n"
+                f"  and choose 'y' when asked to resume.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except RuntimeError as exc:
+            _save_state(state_file, {
+                **_load_state(state_file),
+                "session_id": main_session_id,
+                "completed": _serialise_results(step_results, all_prompts),
+            })
+            print(f"\n    ERROR on step 5: {exc}", file=sys.stderr)
+            print(
+                f"\n  Progress saved. Fix the issue and re-run with the same command\n"
+                f"  to resume from step 5.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        main_session_id = new_sid
+        secs = stats["duration_ms"] / 1000
+        print(
+            f"    time: {secs:.1f}s   "
+            f"tokens in: {stats['input_tokens']:,}   "
+            f"tokens out: {stats['output_tokens']:,}   "
+            f"cost: ${stats['cost_usd']:.4f}"
+        )
+        step_results[5] = (label, response, stats)
+        fname = _save_step_file(out_dir, 5, label, response, stats)
+        print(f"    → {fname}")
+
+        _save_state(state_file, {
+            **_load_state(state_file),
+            "session_id": main_session_id,
+            "completed": _serialise_results(step_results, all_prompts),
+        })
+    else:
+        print(f"\n    [5/5]  {step5_def['label']}  ✓ already done, skipping")
+
+    # -------------------------------------------------------------------
+    # All steps done: compile, convert, move PDF, clean up state
+    # -------------------------------------------------------------------
+    ordered = [step_results[pid] for pid in sorted(step_results)]
+    total_secs = sum(s["duration_ms"] for _, _, s in ordered) / 1000
+    total_in   = sum(s["input_tokens"]  for _, _, s in ordered)
+    total_out  = sum(s["output_tokens"] for _, _, s in ordered)
+    total_cost = sum(s["cost_usd"]      for _, _, s in ordered)
+
+    compiled_md = _compile_and_save(out_dir, pdf_path.stem, conference, step_results)
 
     pdf_result = try_pdf_convert(compiled_md)
     print(f"\n    Markdown : {compiled_md.name}")
@@ -590,12 +724,7 @@ def interactive_mode(reviews_dir: Path, model: str) -> None:
 # Batch runner
 # ---------------------------------------------------------------------------
 
-def _run_batch(
-    papers: list,
-    conference: str,
-    reviews_dir: Path,
-    model: str,
-) -> None:
+def _run_batch(papers: list, conference: str, reviews_dir: Path, model: str) -> None:
     for pdf in papers:
         print(f"\n{'=' * 64}")
         print(f"  Paper      : {pdf.name}")
@@ -613,7 +742,7 @@ def _run_batch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Review academic papers using Claude Code CLI (token-optimized).",
+        description="Review academic papers using Claude Code CLI (token-optimized, parallel).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -622,8 +751,7 @@ def main() -> None:
             "  python paper_reviewer_v2.py --paper ./papers/foo.pdf --conference 'EMNLP 2025'\n"
         ),
     )
-    parser.add_argument("--paper", metavar="FILE",
-                        help="Single PDF to review")
+    parser.add_argument("--paper", metavar="FILE", help="Single PDF to review")
     parser.add_argument("--papers-dir", metavar="DIR",
                         help="Directory of PDFs (all PDFs inside will be reviewed)")
     parser.add_argument("--conference", metavar="NAME",
