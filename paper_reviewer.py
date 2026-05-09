@@ -33,6 +33,18 @@ from typing import Optional
 TOOLS_READ_ONLY = "Read,WebFetch"
 TOOLS_WEB_SEARCH = "Read,WebFetch,WebSearch,mcp__web-search-prime__web_search_prime"
 
+# ---------------------------------------------------------------------------
+# Style instruction — prepended to the very first prompt so it applies to
+# every response in the session.
+# ---------------------------------------------------------------------------
+STYLE_INSTRUCTION = (
+    "Important style rules that apply to every response you give in this conversation:\n"
+    "- Do not use em-dashes (—) or en-dashes (–) anywhere.\n"
+    "- Do not use semicolons (;) as connectors between clauses.\n"
+    "- Do not use colons (:) to introduce a continuation of a sentence.\n"
+    "- Write in plain, direct sentences. Use a period and start a new sentence instead.\n\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Prompt templates  (prompt 0 gets the PDF path prepended at runtime;
@@ -228,10 +240,11 @@ def review_single_paper(
             print("  (web search enabled)", end="")
         print(" …", flush=True)
 
-        # On the very first turn, prepend instructions to read the PDF.
+        # On the very first turn, prepend style rules and instructions to read the PDF.
         if pid == 0:
             text = (
-                f"I have a research paper for you to review. "
+                STYLE_INSTRUCTION
+                + f"I have a research paper for you to review. "
                 f"Please read the full paper at this path:\n{abs_pdf}\n\n"
                 f"After reading it carefully, do the following:\n\n"
                 + prompt["text"]
