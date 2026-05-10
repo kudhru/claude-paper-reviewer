@@ -256,15 +256,34 @@ _KATEX_VERSION = "0.16.11"
 
 def _build_html(md_path: Path) -> str:
     """Convert a Markdown file to a full HTML document with KaTeX math support."""
+    import re
     try:
         import markdown as md_lib
     except ImportError:
         raise RuntimeError("markdown library not available")
     text = md_path.read_text(encoding="utf-8")
+
+    # Protect math blocks from Markdown processing.  The markdown library
+    # converts _..._ to <em> even inside $$...$$, which breaks KaTeX.
+    # Strategy: extract every math block, replace with a neutral placeholder,
+    # run markdown, then restore the originals so KaTeX sees intact LaTeX.
+    saved: list[str] = []
+
+    def _save(m: re.Match) -> str:
+        saved.append(m.group(0))
+        return f"XMATHX{len(saved) - 1}XMATHX"
+
+    text = re.sub(r'\$\$.+?\$\$', _save, text, flags=re.DOTALL)   # display
+    text = re.sub(r'(?<!\$)\$(?!\$).+?(?<!\$)\$(?!\$)', _save, text)  # inline
+
     html_body = md_lib.markdown(
         text,
         extensions=["tables", "fenced_code", "nl2br", "sane_lists", "attr_list"],
     )
+
+    # Restore math blocks (placeholders survive markdown untouched)
+    for i, block in enumerate(saved):
+        html_body = html_body.replace(f"XMATHX{i}XMATHX", block)
     cdn = f"https://cdn.jsdelivr.net/npm/katex@{_KATEX_VERSION}/dist"
     return f"""<!DOCTYPE html>
 <html>
