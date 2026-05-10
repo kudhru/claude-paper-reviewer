@@ -228,10 +228,15 @@ def slugify(text: str) -> str:
 
 def try_pdf_convert(md_path: Path) -> Optional[Path]:
     pdf_path = md_path.with_suffix(".pdf")
+    # --from=markdown-yaml_metadata_block disables YAML block parsing so that
+    # "---" lines inside the document are treated as horizontal rules, not YAML
+    # delimiters. Without this, pandoc errors on "*Time:" in our stats footers
+    # because it interprets "*Time" as a YAML alias reference.
+    base = ["pandoc", str(md_path), "-o", str(pdf_path), "--from=markdown-yaml_metadata_block"]
     for cmd in [
-        ["pandoc", str(md_path), "-o", str(pdf_path), "--pdf-engine=xelatex"],
-        ["pandoc", str(md_path), "-o", str(pdf_path), "--pdf-engine=pdflatex"],
-        ["pandoc", str(md_path), "-o", str(pdf_path)],
+        base + ["--pdf-engine=xelatex"],
+        base + ["--pdf-engine=pdflatex"],
+        base,
     ]:
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=120)
