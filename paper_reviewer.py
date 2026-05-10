@@ -394,49 +394,26 @@ def try_pdf_convert(md_path: Path) -> Optional[Path]:
     return None
 
 
+_SKIP_STEPS = {"Prompt Injection Check", "Paper Explanation"}
+
+
 def _compile_and_save(
     out_dir: Path,
     paper_stem: str,
     conference: str,
     completed: list[tuple[str, str, dict]],
 ) -> Path:
-    """Assemble all step responses into full_review.md and return its path."""
+    """Assemble review steps 2-5 into full_review.md (no metrics, no steps 0-1)."""
     paper_title = paper_stem.replace("_", " ").replace("-", " ").title()
-    total_secs       = sum(s["duration_ms"]              for _, _, s in completed) / 1000
-    total_in_new     = sum(s["input_tokens_new"]         for _, _, s in completed)
-    total_in_write   = sum(s["input_tokens_cache_write"] for _, _, s in completed)
-    total_in_read    = sum(s["input_tokens_cache_read"]  for _, _, s in completed)
-    total_out        = sum(s["output_tokens"]             for _, _, s in completed)
-    total_cost       = sum(s["cost_usd"]                 for _, _, s in completed)
-
-    summary = (
-        f"| Metric | Value |\n"
-        f"|--------|-------|\n"
-        f"| Total time | {total_secs:.1f}s |\n"
-        f"| Tokens in (new) | {total_in_new:,} |\n"
-        f"| Tokens in (cache write) | {total_in_write:,} |\n"
-        f"| Tokens in (cache read) | {total_in_read:,} |\n"
-        f"| Tokens out | {total_out:,} |\n"
-        f"| Total cost | ${total_cost:.4f} |"
-    )
 
     sections = [
         f"# Full Review: {paper_title}\n\n"
-        f"**Conference:** {conference}\n\n"
-        f"## Usage Summary\n\n{summary}"
+        f"**Conference:** {conference}"
     ]
-    for label, response, stats in completed:
-        secs = stats["duration_ms"] / 1000
-        stats_block = (
-            f"\n\n---\n"
-            f"*Time: {secs:.1f}s | "
-            f"In new: {stats['input_tokens_new']:,} | "
-            f"In cache write: {stats['input_tokens_cache_write']:,} | "
-            f"In cache read: {stats['input_tokens_cache_read']:,} | "
-            f"Out: {stats['output_tokens']:,} | "
-            f"Cost: ${stats['cost_usd']:.4f}*"
-        )
-        sections.append(f"---\n\n## {label}\n\n{response}{stats_block}")
+    for label, response, _stats in completed:
+        if label in _SKIP_STEPS:
+            continue
+        sections.append(f"---\n\n## {label}\n\n{response}")
 
     compiled_md = out_dir / "full_review.md"
     compiled_md.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
