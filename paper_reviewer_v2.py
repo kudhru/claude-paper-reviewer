@@ -180,7 +180,9 @@ def run_claude(
     usage = data.get("usage", {})
     stats = {
         "duration_ms": data.get("duration_ms", 0),
-        "input_tokens": usage.get("input_tokens", 0),
+        "input_tokens_new": usage.get("input_tokens", 0),
+        "input_tokens_cache_write": usage.get("cache_creation_input_tokens", 0),
+        "input_tokens_cache_read": usage.get("cache_read_input_tokens", 0),
         "output_tokens": usage.get("output_tokens", 0),
         "cost_usd": data.get("total_cost_usd", 0.0),
     }
@@ -240,17 +242,21 @@ def _compile_and_save(
     ordered = [step_results[pid] for pid in sorted(step_results)]
     paper_title = paper_stem.replace("_", " ").replace("-", " ").title()
 
-    total_secs = sum(s["duration_ms"] for _, _, s in ordered) / 1000
-    total_in   = sum(s["input_tokens"]  for _, _, s in ordered)
-    total_out  = sum(s["output_tokens"] for _, _, s in ordered)
-    total_cost = sum(s["cost_usd"]      for _, _, s in ordered)
+    total_secs     = sum(s["duration_ms"]              for _, _, s in ordered) / 1000
+    total_in_new   = sum(s["input_tokens_new"]         for _, _, s in ordered)
+    total_in_write = sum(s["input_tokens_cache_write"] for _, _, s in ordered)
+    total_in_read  = sum(s["input_tokens_cache_read"]  for _, _, s in ordered)
+    total_out      = sum(s["output_tokens"]             for _, _, s in ordered)
+    total_cost     = sum(s["cost_usd"]                 for _, _, s in ordered)
 
     summary = (
         f"| Metric | Value |\n"
         f"|--------|-------|\n"
         f"| Total time | {total_secs:.1f}s |\n"
-        f"| Total tokens in | {total_in:,} |\n"
-        f"| Total tokens out | {total_out:,} |\n"
+        f"| Tokens in (new) | {total_in_new:,} |\n"
+        f"| Tokens in (cache write) | {total_in_write:,} |\n"
+        f"| Tokens in (cache read) | {total_in_read:,} |\n"
+        f"| Tokens out | {total_out:,} |\n"
         f"| Total cost | ${total_cost:.4f} |"
     )
 
@@ -264,8 +270,10 @@ def _compile_and_save(
         stats_block = (
             f"\n\n---\n"
             f"*Time: {secs:.1f}s | "
-            f"Tokens in: {stats['input_tokens']:,} | "
-            f"Tokens out: {stats['output_tokens']:,} | "
+            f"In new: {stats['input_tokens_new']:,} | "
+            f"In cache write: {stats['input_tokens_cache_write']:,} | "
+            f"In cache read: {stats['input_tokens_cache_read']:,} | "
+            f"Out: {stats['output_tokens']:,} | "
             f"Cost: ${stats['cost_usd']:.4f}*"
         )
         sections.append(f"---\n\n## {label}\n\n{response}{stats_block}")
@@ -280,8 +288,10 @@ def _save_step_file(out_dir: Path, pid: int, label: str, response: str, stats: d
     stats_block = (
         f"\n\n---\n"
         f"*Time: {secs:.1f}s | "
-        f"Tokens in: {stats['input_tokens']:,} | "
-        f"Tokens out: {stats['output_tokens']:,} | "
+        f"In new: {stats['input_tokens_new']:,} | "
+        f"In cache write: {stats['input_tokens_cache_write']:,} | "
+        f"In cache read: {stats['input_tokens_cache_read']:,} | "
+        f"Out: {stats['output_tokens']:,} | "
         f"Cost: ${stats['cost_usd']:.4f}*"
     )
     fname = f"{pid:02d}_{slugify(label)}.md"
@@ -420,8 +430,10 @@ def review_single_paper(
                 print(
                     f"    [{pid}/5]  {step['label']} ✓  "
                     f"time: {secs:.1f}s   "
-                    f"tokens in: {stats['input_tokens']:,}   "
-                    f"tokens out: {stats['output_tokens']:,}   "
+                    f"in new: {stats['input_tokens_new']:,}   "
+                    f"in cache write: {stats['input_tokens_cache_write']:,}   "
+                    f"in cache read: {stats['input_tokens_cache_read']:,}   "
+                    f"out: {stats['output_tokens']:,}   "
                     f"cost: ${stats['cost_usd']:.4f}"
                 )
             return pid, sid, resp, stats
@@ -534,8 +546,10 @@ def review_single_paper(
         secs = stats["duration_ms"] / 1000
         print(
             f"    time: {secs:.1f}s   "
-            f"tokens in: {stats['input_tokens']:,}   "
-            f"tokens out: {stats['output_tokens']:,}   "
+            f"in new: {stats['input_tokens_new']:,}   "
+            f"in cache write: {stats['input_tokens_cache_write']:,}   "
+            f"in cache read: {stats['input_tokens_cache_read']:,}   "
+            f"out: {stats['output_tokens']:,}   "
             f"cost: ${stats['cost_usd']:.4f}"
         )
         step_results[pid] = (label, response, stats)
@@ -629,8 +643,10 @@ def review_single_paper(
         secs = stats["duration_ms"] / 1000
         print(
             f"    time: {secs:.1f}s   "
-            f"tokens in: {stats['input_tokens']:,}   "
-            f"tokens out: {stats['output_tokens']:,}   "
+            f"in new: {stats['input_tokens_new']:,}   "
+            f"in cache write: {stats['input_tokens_cache_write']:,}   "
+            f"in cache read: {stats['input_tokens_cache_read']:,}   "
+            f"out: {stats['output_tokens']:,}   "
             f"cost: ${stats['cost_usd']:.4f}"
         )
         step_results[5] = (label, response, stats)
@@ -648,11 +664,13 @@ def review_single_paper(
     # -------------------------------------------------------------------
     # All steps done: compile, convert, move PDF, clean up state
     # -------------------------------------------------------------------
-    ordered = [step_results[pid] for pid in sorted(step_results)]
-    total_secs = sum(s["duration_ms"] for _, _, s in ordered) / 1000
-    total_in   = sum(s["input_tokens"]  for _, _, s in ordered)
-    total_out  = sum(s["output_tokens"] for _, _, s in ordered)
-    total_cost = sum(s["cost_usd"]      for _, _, s in ordered)
+    ordered        = [step_results[pid] for pid in sorted(step_results)]
+    total_secs     = sum(s["duration_ms"]              for _, _, s in ordered) / 1000
+    total_in_new   = sum(s["input_tokens_new"]         for _, _, s in ordered)
+    total_in_write = sum(s["input_tokens_cache_write"] for _, _, s in ordered)
+    total_in_read  = sum(s["input_tokens_cache_read"]  for _, _, s in ordered)
+    total_out      = sum(s["output_tokens"]             for _, _, s in ordered)
+    total_cost     = sum(s["cost_usd"]                 for _, _, s in ordered)
 
     compiled_md = _compile_and_save(out_dir, pdf_path.stem, conference, step_results)
 
@@ -664,8 +682,10 @@ def review_single_paper(
         print("    PDF      : skipped (pandoc not found — brew install pandoc)")
     print(
         f"\n    Total — time: {total_secs:.1f}s   "
-        f"tokens in: {total_in:,}   "
-        f"tokens out: {total_out:,}   "
+        f"in new: {total_in_new:,}   "
+        f"in cache write: {total_in_write:,}   "
+        f"in cache read: {total_in_read:,}   "
+        f"out: {total_out:,}   "
         f"cost: ${total_cost:.4f}"
     )
 
