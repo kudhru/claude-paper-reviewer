@@ -217,16 +217,12 @@ def slugify(text: str) -> str:
 
 
 _PDF_CSS = """
-@page {
-    margin: 0.85in 1in 0.85in 1in;
-    @bottom-right { content: counter(page); font-size: 9pt; color: #666; }
-}
+@page { margin: 0.85in 1in 0.85in 1in; }
 body {
     font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
     font-size: 11pt;
     line-height: 1.6;
     color: #24292f;
-    max-width: 100%;
 }
 h1 { font-size: 1.75em; border-bottom: 2px solid #d0d7de; padding-bottom: 0.3em; margin-top: 1.5em; margin-bottom: 0.6em; }
 h2 { font-size: 1.35em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.2em; margin-top: 1.4em; margin-bottom: 0.5em; }
@@ -256,35 +252,89 @@ strong { font-weight: 600; }
 a { color: #0969da; text-decoration: none; }
 """
 
-def _preprocess_latex_math(text: str) -> str:
-    """Convert $$...$$ and $...$ LaTeX to MathML so weasyprint can render it."""
-    import re
+_KATEX_VERSION = "0.16.11"
+
+def _build_html(md_path: Path) -> str:
+    """Convert a Markdown file to a full HTML document with KaTeX math support."""
     try:
-        import latex2mathml.converter as l2m
+        import markdown as md_lib
     except ImportError:
-        return text
-
-    def replace_display(m: re.Match) -> str:
-        try:
-            return l2m.convert(m.group(1), display="block")
-        except Exception:
-            return m.group(0)
-
-    def replace_inline(m: re.Match) -> str:
-        try:
-            return l2m.convert(m.group(1), display="inline")
-        except Exception:
-            return m.group(0)
-
-    # Display math first (must come before inline to avoid double-matching)
-    text = re.sub(r'\$\$(.+?)\$\$', replace_display, text, flags=re.DOTALL)
-    # Inline math — skip lone $ used as currency (no letter adjacent on both sides)
-    text = re.sub(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', replace_inline, text)
-    return text
+        raise RuntimeError("markdown library not available")
+    text = md_path.read_text(encoding="utf-8")
+    html_body = md_lib.markdown(
+        text,
+        extensions=["tables", "fenced_code", "nl2br", "sane_lists", "attr_list"],
+    )
+    cdn = f"https://cdn.jsdelivr.net/npm/katex@{_KATEX_VERSION}/dist"
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="{cdn}/katex.min.css">
+<script defer src="{cdn}/katex.min.js"></script>
+<script defer src="{cdn}/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {{
+    delimiters: [
+      {{left: '$$', right: '$$', display: true}},
+      {{left: '$',  right: '$',  display: false}}
+    ],
+    throwOnError: false
+  }});"></script>
+<style>{_PDF_CSS}</style>
+</head>
+<body>
+{html_body}
+</body>
+</html>"""
 
 
 def try_pdf_convert(md_path: Path) -> Optional[Path]:
+    """Convert a Markdown review to PDF.
+
+    Primary: Chrome headless — full CSS, KaTeX math, same rendering as the
+    web browser.  Fallback: weasyprint (no JS, limited math).
+    """
+    import tempfile
     pdf_path = md_path.with_suffix(".pdf")
+
+    # ── Primary: Chrome headless ──────────────────────────────────────────────
+    chrome_candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "google-chrome",
+        "chromium",
+    ]
+    try:
+        html = _build_html(md_path)
+        with tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False, mode="w", encoding="utf-8"
+        ) as f:
+            f.write(html)
+            tmp_html = Path(f.name)
+        try:
+            for chrome in chrome_candidates:
+                cmd = [
+                    chrome,
+                    "--headless=new",
+                    f"--print-to-pdf={pdf_path}",
+                    "--print-to-pdf-no-header",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--run-all-compositor-stages-before-draw",
+                    f"file://{tmp_html}",
+                ]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=60)
+                    if r.returncode == 0 and pdf_path.exists():
+                        return pdf_path
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+        finally:
+            tmp_html.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # ── Fallback: weasyprint ──────────────────────────────────────────────────
     try:
         import ctypes
         for _lib in ["/opt/homebrew/lib/libpango-1.0.0.dylib",
@@ -296,20 +346,22 @@ def try_pdf_convert(md_path: Path) -> Optional[Path]:
         import markdown as md_lib
         from weasyprint import HTML, CSS
         text = md_path.read_text(encoding="utf-8")
-        text = _preprocess_latex_math(text)
         html_body = md_lib.markdown(
             text,
             extensions=["tables", "fenced_code", "nl2br", "sane_lists", "attr_list"],
         )
-        html = f"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>{html_body}</body></html>"
+        html = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+            f"<body>{html_body}</body></html>"
+        )
         HTML(string=html, base_url=str(md_path.parent)).write_pdf(
-            str(pdf_path),
-            stylesheets=[CSS(string=_PDF_CSS)],
+            str(pdf_path), stylesheets=[CSS(string=_PDF_CSS)]
         )
         if pdf_path.exists():
             return pdf_path
     except Exception:
         pass
+
     return None
 
 
