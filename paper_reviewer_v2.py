@@ -216,27 +216,72 @@ def slugify(text: str) -> str:
     return result.strip("_")
 
 
+_PDF_CSS = """
+@page {
+    margin: 0.85in 1in 0.85in 1in;
+    @bottom-right { content: counter(page); font-size: 9pt; color: #666; }
+}
+body {
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: #24292f;
+    max-width: 100%;
+}
+h1 { font-size: 1.75em; border-bottom: 2px solid #d0d7de; padding-bottom: 0.3em; margin-top: 1.5em; margin-bottom: 0.6em; }
+h2 { font-size: 1.35em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.2em; margin-top: 1.4em; margin-bottom: 0.5em; }
+h3 { font-size: 1.1em; margin-top: 1.1em; margin-bottom: 0.4em; }
+h4 { font-size: 1em; margin-top: 0.9em; margin-bottom: 0.3em; }
+p { margin: 0.5em 0; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 10.5pt; }
+th, td { border: 1px solid #d0d7de; padding: 6px 13px; text-align: left; vertical-align: top; }
+th { background-color: #f6f8fa; font-weight: 600; }
+tr:nth-child(even) td { background-color: #f6f8fa; }
+hr { border: none; border-top: 1px solid #d0d7de; margin: 1.4em 0; }
+code {
+    background-color: #f6f8fa;
+    padding: 2px 5px;
+    border-radius: 4px;
+    font-size: 0.88em;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre { background-color: #f6f8fa; border-radius: 6px; padding: 12px 16px; overflow-x: auto; }
+pre code { background: none; padding: 0; font-size: 0.88em; }
+blockquote { border-left: 4px solid #d0d7de; padding: 0 1em; color: #57606a; margin: 0.5em 0; }
+ul, ol { padding-left: 2em; margin: 0.4em 0; }
+li { margin: 0.2em 0; }
+li > ul, li > ol { margin: 0.1em 0; }
+em { color: #57606a; }
+strong { font-weight: 600; }
+a { color: #0969da; text-decoration: none; }
+"""
+
 def try_pdf_convert(md_path: Path) -> Optional[Path]:
     pdf_path = md_path.with_suffix(".pdf")
-    # --from=markdown-yaml_metadata_block disables YAML block parsing so that
-    # "---" lines inside the document are treated as horizontal rules, not YAML
-    # delimiters. Without this, pandoc errors on "*Time:" in our stats footers
-    # because it interprets "*Time" as a YAML alias reference.
-    base  = ["pandoc", str(md_path), "-o", str(pdf_path), "--from=markdown-yaml_metadata_block"]
-    base2 = ["pandoc", str(md_path), "-o", str(pdf_path), "--from=markdown-yaml_metadata_block-raw_tex"]
-    for cmd in [
-        base  + ["--pdf-engine=xelatex"],
-        base  + ["--pdf-engine=pdflatex"],
-        base,
-        base2 + ["--pdf-engine=xelatex"],
-        base2,
-    ]:
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=120)
-            if r.returncode == 0:
-                return pdf_path
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
+    try:
+        import ctypes
+        for _lib in ["/opt/homebrew/lib/libpango-1.0.0.dylib",
+                     "/opt/homebrew/lib/libpangocairo-1.0.0.dylib"]:
+            try:
+                ctypes.CDLL(_lib)
+            except OSError:
+                pass
+        import markdown as md_lib
+        from weasyprint import HTML, CSS
+        text = md_path.read_text(encoding="utf-8")
+        html_body = md_lib.markdown(
+            text,
+            extensions=["tables", "fenced_code", "nl2br", "sane_lists", "attr_list"],
+        )
+        html = f"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>{html_body}</body></html>"
+        HTML(string=html, base_url=str(md_path.parent)).write_pdf(
+            str(pdf_path),
+            stylesheets=[CSS(string=_PDF_CSS)],
+        )
+        if pdf_path.exists():
+            return pdf_path
+    except Exception:
+        pass
     return None
 
 
