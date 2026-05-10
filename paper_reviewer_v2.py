@@ -581,11 +581,10 @@ def review_single_paper(
             f"4. **Overall Recommendation** — your recommendation "
             f"(Accept / Weak Accept / Weak Reject / Reject) with a brief justification.\n\n"
             f"**Part 2: Comprehensive Revision Plan**\n"
-            f"Suggest a comprehensive revision plan (writing + experiments) for the main "
-            f"track or dataset track of {conference}, addressing all issues identified "
-            f"across the reviews above — readability and presentation, consistency and "
-            f"completeness, novelty and related work (see the novelty review above), "
-            f"and the weaknesses listed in Part 1."
+            f"Suggest a comprehensive revision plan (writing + experiments) for {conference}, "
+            f"addressing all issues identified across the reviews above — readability and "
+            f"presentation, consistency and completeness, novelty and related work "
+            f"(see the novelty review above), and the weaknesses listed in Part 1."
         )
 
         label = step5_def["label"]
