@@ -222,11 +222,14 @@ def try_pdf_convert(md_path: Path) -> Optional[Path]:
     # "---" lines inside the document are treated as horizontal rules, not YAML
     # delimiters. Without this, pandoc errors on "*Time:" in our stats footers
     # because it interprets "*Time" as a YAML alias reference.
-    base = ["pandoc", str(md_path), "-o", str(pdf_path), "--from=markdown-yaml_metadata_block"]
+    base  = ["pandoc", str(md_path), "-o", str(pdf_path), "--from=markdown-yaml_metadata_block"]
+    base2 = ["pandoc", str(md_path), "-o", str(pdf_path), "--from=markdown-yaml_metadata_block-raw_tex"]
     for cmd in [
-        base + ["--pdf-engine=xelatex"],
-        base + ["--pdf-engine=pdflatex"],
+        base  + ["--pdf-engine=xelatex"],
+        base  + ["--pdf-engine=pdflatex"],
         base,
+        base2 + ["--pdf-engine=xelatex"],
+        base2,
     ]:
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=120)
