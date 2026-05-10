@@ -256,6 +256,33 @@ strong { font-weight: 600; }
 a { color: #0969da; text-decoration: none; }
 """
 
+def _preprocess_latex_math(text: str) -> str:
+    """Convert $$...$$ and $...$ LaTeX to MathML so weasyprint can render it."""
+    import re
+    try:
+        import latex2mathml.converter as l2m
+    except ImportError:
+        return text
+
+    def replace_display(m: re.Match) -> str:
+        try:
+            return l2m.convert(m.group(1), display="block")
+        except Exception:
+            return m.group(0)
+
+    def replace_inline(m: re.Match) -> str:
+        try:
+            return l2m.convert(m.group(1), display="inline")
+        except Exception:
+            return m.group(0)
+
+    # Display math first (must come before inline to avoid double-matching)
+    text = re.sub(r'\$\$(.+?)\$\$', replace_display, text, flags=re.DOTALL)
+    # Inline math — skip lone $ used as currency (no letter adjacent on both sides)
+    text = re.sub(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', replace_inline, text)
+    return text
+
+
 def try_pdf_convert(md_path: Path) -> Optional[Path]:
     pdf_path = md_path.with_suffix(".pdf")
     try:
@@ -269,6 +296,7 @@ def try_pdf_convert(md_path: Path) -> Optional[Path]:
         import markdown as md_lib
         from weasyprint import HTML, CSS
         text = md_path.read_text(encoding="utf-8")
+        text = _preprocess_latex_math(text)
         html_body = md_lib.markdown(
             text,
             extensions=["tables", "fenced_code", "nl2br", "sane_lists", "attr_list"],
