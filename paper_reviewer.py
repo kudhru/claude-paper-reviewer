@@ -88,7 +88,15 @@ PROMPTS = [
             "perspective of a third-person reviewer who may or may not be an expert in "
             "this field. Suggest writing and presentation edits section by section to "
             "improve readability and presentation. Make sure the narrative and story of "
-            "the paper is clear without any ambiguity or confusion."
+            "the paper is clear without any ambiguity or confusion.\n\n"
+            "At the end of your review, provide a rewritten version of the abstract and "
+            "the introduction. Apply all the writing improvements you identified — clearer "
+            "narrative, better structure, sharper framing, tighter language. Where the "
+            "existing text already works well, keep it. Where information needed to write "
+            "a specific sentence is not available in the paper (e.g., a result that was "
+            "not reported, or a claim that was not substantiated), insert a placeholder "
+            "like [PLACEHOLDER: one-line description of what is missing] instead of "
+            "fabricating content."
         ),
         "web_search": False,
     },
