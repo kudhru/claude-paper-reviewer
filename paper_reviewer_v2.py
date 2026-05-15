@@ -32,6 +32,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -534,14 +535,20 @@ def review_single_paper(
             ind = step.get("independent", False)
 
             # All phase 1 steps need to read the paper from scratch.
+            # Copy only the target PDF into a temp dir so --add-dir never
+            # exposes other PDFs in papers/ to an independent fresh session.
+            tmp_dir = tempfile.mkdtemp(prefix="paper_review_")
+            tmp_pdf = Path(tmp_dir) / abs_pdf.name
+            shutil.copy2(abs_pdf, tmp_pdf)
+
             intro = (
                 f"I have a research paper for you to review. "
-                f"Please read the full paper at this path:\n{abs_pdf}\n\n"
+                f"Please read the full paper at this path:\n{tmp_pdf}\n\n"
                 f"After reading it carefully, do the following:\n\n"
                 if pid == 0
                 else
                 f"I have a research paper. Please read the full paper at this path:\n"
-                f"{abs_pdf}\n\n"
+                f"{tmp_pdf}\n\n"
                 f"After reading it carefully, do the following:\n\n"
             )
             text = STYLE_INSTRUCTION + intro + step["text"]
@@ -554,13 +561,16 @@ def review_single_paper(
             with print_lock:
                 print(f"    [{pid}/5]  {step['label']}{tag_str} … started", flush=True)
 
-            sid, resp, stats = run_claude(
-                prompt=text,
-                session_id=None,
-                model=model,
-                tools=TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY,
-                extra_dirs=[str(abs_pdf.parent)],
-            )
+            try:
+                sid, resp, stats = run_claude(
+                    prompt=text,
+                    session_id=None,
+                    model=model,
+                    tools=TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY,
+                    extra_dirs=[tmp_dir],
+                )
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             secs = stats["duration_ms"] / 1000
             with print_lock:
                 print(

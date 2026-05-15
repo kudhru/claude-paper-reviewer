@@ -25,6 +25,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -524,16 +525,22 @@ def review_single_paper(
         print(" …", flush=True)
 
         if pid == 0:
+            # Copy only the target PDF into a temp dir so --add-dir never
+            # exposes other PDFs in papers/ to the fresh session.
+            tmp_dir = tempfile.mkdtemp(prefix="paper_review_")
+            tmp_pdf = Path(tmp_dir) / abs_pdf.name
+            shutil.copy2(abs_pdf, tmp_pdf)
             text = (
                 STYLE_INSTRUCTION
                 + f"I have a research paper for you to review. "
-                f"Please read the full paper at this path:\n{abs_pdf}\n\n"
+                f"Please read the full paper at this path:\n{tmp_pdf}\n\n"
                 f"After reading it carefully, do the following:\n\n"
                 + prompt["text"]
             )
-            extra_dirs = [str(abs_pdf.parent)]
+            extra_dirs = [tmp_dir]
         else:
-            text      = prompt["text"]
+            tmp_dir    = None
+            text       = prompt["text"]
             extra_dirs = None
 
         tools = TOOLS_WEB_SEARCH if web else TOOLS_READ_ONLY
@@ -581,6 +588,10 @@ def review_single_paper(
                 file=sys.stderr,
             )
             sys.exit(1)
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                tmp_dir = None
 
         # Step succeeded — print stats and save individual file.
         secs = stats["duration_ms"] / 1000
