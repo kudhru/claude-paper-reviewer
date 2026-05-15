@@ -3,3 +3,5 @@ papers/*.pdf
 __pycache__/
 *.pyc
 .DS_Store
+cowork/reviews/
+cowork/papers/*.pdf

@@ -1,0 +1,6 @@
+{
+  "model": "claude-sonnet-4-6",
+  "reviews_dir": "./reviews",
+  "papers_dir": "./papers",
+  "prompts_file": "./review_prompts.json"
+}
