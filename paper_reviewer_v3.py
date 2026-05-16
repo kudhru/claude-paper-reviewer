@@ -701,6 +701,13 @@ def _run_batch(papers: list, conference: str, reviews_dir: Path, model: str) -> 
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if not os.isatty(sys.stdout.fileno()):
+        sys.exit(
+            "Error: paper_reviewer_v3.py must be run from a real terminal.\n"
+            "stdout is not a TTY — Claude would run non-interactively (API credits).\n"
+            "Use v2 (paper_reviewer_v2.py) for non-TTY / piped usage."
+        )
+
     parser = argparse.ArgumentParser(
         description="Review academic papers with interactive Claude sessions (v3).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
