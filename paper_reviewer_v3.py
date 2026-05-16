@@ -169,6 +169,7 @@ def run_step(
     finally:
         proc.kill()
         proc.wait()
+        os.system("stty sane")   # restore terminal after Claude's TUI exits
 
     return resolved_sid, response, new_cursor, time.time() - t0
 

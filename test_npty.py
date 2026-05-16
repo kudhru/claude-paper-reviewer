@@ -97,9 +97,10 @@ if jsonl.exists():
         except json.JSONDecodeError:
             pass
 
-# Step 5: kill Claude
+# Step 5: kill Claude and restore terminal
 proc.kill()
 proc.wait()
+os.system("stty sane")
 print("\nClaude process killed.")
 
 print("-" * 60)
