@@ -2,13 +2,20 @@
 """
 paper_reviewer_v3.py — Paper reviewer using interactive Claude PTY sessions.
 
-Uses genuine interactive Claude sessions (PTY, isatty=True) instead of
-`claude -p` so reviews draw from subscription limits, not Agent SDK credits.
+Uses genuine interactive Claude sessions (PTY, isatty=True) so reviews draw
+from subscription limits rather than Agent SDK credits.
 
-Architecture mirrors v2 (parallel Phase 1), but Claude sessions are managed
-as PTY processes rather than CLI subprocesses.  No token/cost stats are
+Key design: pass the prompt as a positional CLI arg so no TUI interaction is
+needed.  Each step is:
+
+    claude "prompt text" --model M [--resume session_id] [--add-dir dir]
+
+The PTY wrapper ensures isatty=True (subscription billing).  Response
+collection uses ~/.claude/sessions/{pid}.json status monitoring and the
+conversation JSONL at ~/.claude/projects/{cwd}/{session_id}.jsonl.
+
+Architecture mirrors v2 (parallel Phase 1).  No token / cost stats are
 available in interactive mode; wall-clock time per step is reported instead.
-Resume after crash is not supported (PTY sessions cannot be rehydrated).
 
 Usage:
     python paper_reviewer_v3.py
@@ -17,7 +24,7 @@ Usage:
 
 Requirements:
     - Claude Code CLI installed and authenticated
-    - Python 3.10+  (stdlib only for Claude interaction — no pip installs)
+    - Python 3.10+  (stdlib only — no pip installs for Claude interaction)
 """
 
 import argparse
@@ -25,7 +32,6 @@ import fcntl
 import json
 import os
 import pty
-import select
 import shutil
 import struct
 import subprocess
@@ -39,17 +45,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# PTY session (adapted from github.com/kudhru/claude-interactive-runner)
-#
-# Changes vs the original:
-#   • default timeout 1200 s (20 min) — paper review steps need it
-#   • _wait_for_response uses file-size settling (3 s stable) to capture the
-#     FULL response including text written after tool calls finish
-#   • _collect_all_new_text gathers every text block from every assistant
-#     entry since the cursor — nothing is missed
-#   • send() collapses newlines to spaces before typing so bare newlines
-#     never trigger premature submission in the PTY input field
+# PTY + JSONL helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 _SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
@@ -60,194 +58,168 @@ def _projects_dir() -> str:
     return os.path.expanduser(f"~/.claude/projects/{cwd.replace('/', '-')}")
 
 
-class ClaudeSession:
-    """One PTY-backed interactive Claude session (isatty=True)."""
-
-    COLS, ROWS = 220, 50
-
-    def __init__(self, model: str = "claude-sonnet-4-6", timeout: int = 1200):
-        self.model = model
-        self.timeout = timeout
-        self._pid: Optional[int] = None
-        self._master_fd: Optional[int] = None
-        self._session_file: Optional[str] = None
-        self._line_cursor: int = 0
-
-    # ── lifecycle ──────────────────────────────────────────────────────────────
-
-    def start(self) -> "ClaudeSession":
-        master_fd, slave_fd = pty.openpty()
-        winsize = struct.pack("HHHH", self.ROWS, self.COLS, 0, 0)
-        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
-
-        pid = os.fork()
-        if pid == 0:  # child: become Claude
-            os.setsid()
-            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-            os.dup2(slave_fd, 0)
-            os.dup2(slave_fd, 1)
-            os.dup2(slave_fd, 2)
-            os.close(master_fd)
-            os.close(slave_fd)
-            os.execvp("claude", ["claude", "--model", self.model])
-            os._exit(1)
-
-        os.close(slave_fd)
-        self._pid = pid
-        self._master_fd = master_fd
-
-        time.sleep(4)       # let Claude's TUI finish initialising
-        self._drain(2)
-
-        session_id = self._resolve_session_id()
-        if not session_id:
-            self.close()
-            raise RuntimeError("Claude session did not start within timeout.")
-
-        self._session_file = f"{_projects_dir()}/{session_id}.jsonl"
-        return self
-
-    def close(self) -> None:
-        if self._pid:
+def _resolve_session_id(pid: int, timeout: int = 30) -> Optional[str]:
+    """Poll ~/.claude/sessions/{pid}.json until sessionId appears."""
+    path = f"{_SESSIONS_DIR}/{pid}.json"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
             try:
-                os.kill(self._pid, 9)
-                os.waitpid(self._pid, 0)
-            except OSError:
-                pass
-        if self._master_fd is not None:
-            try:
-                os.close(self._master_fd)
-            except OSError:
-                pass
-        self._pid = None
-        self._master_fd = None
-
-    def __enter__(self):
-        return self.start()
-
-    def __exit__(self, *_):
-        self.close()
-
-    # ── public API ─────────────────────────────────────────────────────────────
-
-    def send(self, prompt: str) -> str:
-        """
-        Send a prompt and wait for the complete response.
-        Newlines are collapsed to spaces before typing so that bare newline
-        characters never trigger premature submission in the PTY.
-        """
-        flat = " ".join(prompt.split())
-        self._type(flat)
-        return self._wait_for_response()
-
-    # ── internals ──────────────────────────────────────────────────────────────
-
-    def _drain(self, timeout: float = 0.5) -> None:
-        try:
-            while select.select([self._master_fd], [], [], timeout)[0]:
-                os.read(self._master_fd, 4096)
-        except OSError:
-            pass
-
-    def _type(self, text: str) -> None:
-        for ch in text:
-            os.write(self._master_fd, ch.encode())
-            time.sleep(0.01)
-        time.sleep(0.1)
-        os.write(self._master_fd, b"\r")
-
-    def _resolve_session_id(self) -> Optional[str]:
-        path = f"{_SESSIONS_DIR}/{self._pid}.json"
-        for _ in range(20):
-            if os.path.exists(path):
                 with open(path) as f:
-                    return json.load(f).get("sessionId")
-            time.sleep(0.3)
+                    sid = json.load(f).get("sessionId")
+                if sid:
+                    return sid
+            except (OSError, json.JSONDecodeError):
+                pass
+        time.sleep(0.3)
+    return None
+
+
+def _get_status(path: str) -> Optional[str]:
+    try:
+        with open(path) as f:
+            return json.load(f).get("status")
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
 
-    def _wait_for_response(self) -> str:
-        """
-        Poll until the session JSONL file has not grown for SETTLE_SECS after
-        at least one new assistant message appears, then collect all text.
-        The settling window ensures the full response is captured even when
-        Claude makes tool calls before writing its final reply.
-        """
-        SETTLE_SECS = 3.0
-        deadline = time.time() + self.timeout
-        prev_size: int = -1
-        stable_since: Optional[float] = None
 
+def _collect_new_text(session_file: str, line_cursor: int) -> tuple[str, int]:
+    """Return (text, new_cursor) for all new assistant blocks since cursor."""
+    try:
+        with open(session_file) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return "", line_cursor
+
+    texts: list[str] = []
+    new_cursor = line_cursor
+    for i in range(line_cursor, len(lines)):
+        try:
+            obj = json.loads(lines[i])
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "assistant":
+            for block in obj.get("message", {}).get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = block["text"].strip()
+                    if t:
+                        texts.append(t)
+            new_cursor = i + 1
+    return "\n\n".join(texts), new_cursor
+
+
+def _kill_wait(pid: int, master_fd: int) -> None:
+    try:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+
+def run_step_pty(
+    prompt: str,
+    session_id: Optional[str],
+    line_cursor: int,
+    model: str,
+    extra_dirs: Optional[list] = None,
+    timeout: int = 3600,
+) -> tuple[str, str, int, float]:
+    """
+    Run one review step as an interactive Claude PTY session.
+
+    The prompt is the first positional arg to `claude`, so no TUI interaction
+    is needed — Claude reads it immediately on startup:
+
+        claude "prompt" --model M [--resume sid] [--add-dir dir …]
+
+    Returns (session_id, response, new_line_cursor, duration_s).
+    """
+    cmd = ["claude", prompt, "--model", model, "--dangerously-skip-permissions"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    if extra_dirs:
+        for d in extra_dirs:
+            cmd += ["--add-dir", d]
+
+    t0 = time.time()
+    master_fd, slave_fd = pty.openpty()
+    winsize = struct.pack("HHHH", 50, 220, 0, 0)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+
+    pid = os.fork()
+    if pid == 0:                        # child: become Claude
+        os.close(master_fd)
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        os.dup2(slave_fd, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        os.close(slave_fd)
+        os.execvp(cmd[0], cmd)
+        os._exit(1)
+
+    os.close(slave_fd)
+
+    # Background thread: drain PTY master so Claude never blocks on stdout
+    _stop_drain = threading.Event()
+
+    def _drain() -> None:
+        import select as _select
+        while not _stop_drain.is_set():
+            try:
+                r, _, _ = _select.select([master_fd], [], [], 0.5)
+                if r:
+                    os.read(master_fd, 4096)
+            except OSError:
+                break
+
+    drain_thread = threading.Thread(target=_drain, daemon=True)
+    drain_thread.start()
+
+    try:
+        # Resolve session ID — status file appears once Claude starts
+        if session_id is None:
+            resolved_sid = _resolve_session_id(pid)
+            if not resolved_sid:
+                raise RuntimeError("Claude session did not start within timeout")
+        else:
+            resolved_sid = session_id
+
+        session_file = f"{_projects_dir()}/{resolved_sid}.jsonl"
+        status_path = f"{_SESSIONS_DIR}/{pid}.json"
+        deadline = time.time() + timeout
+        FLUSH_BUFFER = 2.0
+
+        # Phase 1: wait until Claude starts processing (leaves idle)
         while time.time() < deadline:
             time.sleep(0.5)
-            self._drain(0.1)
+            status = _get_status(status_path)
+            if status is not None and status != "idle":
+                break
 
-            try:
-                size = os.path.getsize(self._session_file)
-            except (FileNotFoundError, OSError):
-                prev_size = -1
-                stable_since = None
-                continue
+        # Phase 2: wait until Claude finishes (returns to idle)
+        response = ""
+        new_cursor = line_cursor
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if _get_status(status_path) == "idle":
+                time.sleep(FLUSH_BUFFER)
+                response, new_cursor = _collect_new_text(session_file, line_cursor)
+                break
+        else:
+            response, new_cursor = _collect_new_text(session_file, line_cursor)
 
-            if size != prev_size:
-                prev_size = size
-                stable_since = None          # still growing — reset settle timer
-            else:
-                if stable_since is None:
-                    if self._has_new_assistant():
-                        stable_since = time.time()
-                elif time.time() - stable_since >= SETTLE_SECS:
-                    return self._collect_all_new_text()
+    finally:
+        _stop_drain.set()
+        _kill_wait(pid, master_fd)
+        drain_thread.join(timeout=2)
 
-        # Timed out — return whatever is available
-        return self._collect_all_new_text() or "[timeout]"
-
-    def _has_new_assistant(self) -> bool:
-        """Return True if any new assistant entry exists after the cursor."""
-        try:
-            with open(self._session_file) as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            return False
-        for line in lines[self._line_cursor:]:
-            try:
-                if json.loads(line).get("type") == "assistant":
-                    return True
-            except json.JSONDecodeError:
-                pass
-        return False
-
-    def _collect_all_new_text(self) -> str:
-        """
-        Gather every text block from every new assistant entry since the
-        cursor and advance the cursor.  Concatenates all blocks so that
-        responses split across multiple assistant messages (e.g. after tool
-        calls) are returned as one complete string.
-        """
-        try:
-            with open(self._session_file) as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            return ""
-
-        texts: list[str] = []
-        new_cursor = self._line_cursor
-
-        for i in range(self._line_cursor, len(lines)):
-            try:
-                obj = json.loads(lines[i])
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") == "assistant":
-                for block in obj.get("message", {}).get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        t = block["text"].strip()
-                        if t:
-                            texts.append(t)
-                new_cursor = i + 1
-
-        self._line_cursor = new_cursor
-        return "\n\n".join(texts)
+    return resolved_sid, response, new_cursor, time.time() - t0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -272,7 +244,7 @@ PROMPTS = [
             "how the review should be written. These may be added by the authors or by the "
             "conference or journal organizers. Flag any such things."
         ),
-        "independent": False,   # main chain start — session kept open
+        "independent": False,   # main chain start — session kept for steps 2, 3, 5
     },
     {
         "id": 1,
@@ -541,69 +513,80 @@ def review_single_paper(
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Output → {out_dir}")
 
-    # {pid: (label, response, duration_s)}
+    # Temp dir with only this PDF — prevents multi-PDF context contamination
+    tmp_dir = tempfile.mkdtemp(prefix="paper_review_")
+    tmp_pdf = Path(tmp_dir) / abs_pdf.name
+    shutil.copy2(abs_pdf, tmp_pdf)
+
     step_results: dict[int, tuple[str, str, float]] = {}
+    main_session_id: Optional[str] = None
+    main_line_cursor: int = 0
     print_lock = threading.Lock()
+
+    def _make_intro(pid: int) -> str:
+        if pid == 0:
+            return (
+                f"I have a research paper for you to review. "
+                f"Please read the full paper at this path:\n{tmp_pdf}\n\n"
+                f"After reading it carefully, do the following:\n\n"
+            )
+        return (
+            f"I have a research paper. Please read the full paper at this path:\n"
+            f"{tmp_pdf}\n\n"
+            f"After reading it carefully, do the following:\n\n"
+        )
 
     # ----------------------------------------------------------------
     # Phase 1 — steps 0, 1, 4 in parallel, each in its own PTY session.
-    # Step 0's session is kept open for the main chain (steps 2, 3, 5).
+    # Step 0's session ID is kept for chained steps 2, 3, 5.
     # ----------------------------------------------------------------
     print("\n  Phase 1 — running steps [0, 1, 4] in parallel …")
 
     phase1_defs = [p for p in PROMPTS if p["id"] in {0, 1, 4}]
-    main_session: Optional[ClaudeSession] = None
 
-    def _run_phase1_step(
-        step: dict,
-    ) -> tuple[int, str, float, Optional[ClaudeSession]]:
+    def _run_phase1(step: dict) -> tuple[int, str, str, int, float]:
         pid = step["id"]
-        is_main = not step["independent"]   # True only for step 0
-
-        intro = (
-            f"I have a research paper for you to review. "
-            f"Please read the full paper at this path:\n{abs_pdf}\n\n"
-            f"After reading it carefully, do the following:\n\n"
-            if pid == 0 else
-            f"I have a research paper. Please read the full paper at this path:\n"
-            f"{abs_pdf}\n\n"
-            f"After reading it carefully, do the following:\n\n"
-        )
-        full_prompt = STYLE_INSTRUCTION + intro + step["text"]
-
+        full_prompt = STYLE_INSTRUCTION + _make_intro(pid) + step["text"]
         with print_lock:
             print(f"    [{pid}/5]  {step['label']} … started", flush=True)
 
-        t0 = time.time()
-        session = ClaudeSession(model=model).start()
-        try:
-            response = session.send(full_prompt)
-        except Exception:
-            session.close()
-            raise
-        elapsed = time.time() - t0
+        sid, resp, cursor, elapsed = run_step_pty(
+            full_prompt,
+            session_id=None,
+            line_cursor=0,
+            model=model,
+            extra_dirs=[tmp_dir],
+        )
 
         with print_lock:
             print(f"    [{pid}/5]  {step['label']} ✓  time: {elapsed:.1f}s", flush=True)
 
-        if is_main:
-            return pid, response, elapsed, session   # caller owns the session
-        session.close()
-        return pid, response, elapsed, None
+        return pid, sid, resp, cursor, elapsed
 
     phase1_ok: dict[int, tuple] = {}
     phase1_err: dict[int, Exception] = {}
 
+    step_defs_by_id = {s["id"]: s for s in phase1_defs}
+
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(_run_phase1_step, step): step["id"]
+            executor.submit(_run_phase1, step): step["id"]
             for step in phase1_defs
         }
         for future in as_completed(futures):
             orig_pid = futures[future]
             try:
-                pid, resp, secs, sess = future.result()
-                phase1_ok[pid] = (resp, secs, sess)
+                pid, sid, resp, cursor, elapsed = future.result()
+                phase1_ok[pid] = (sid, resp, cursor, elapsed)
+                # Save the file immediately — don't wait for all 3 to finish
+                step = step_defs_by_id[pid]
+                step_results[pid] = (step["label"], resp, elapsed)
+                fname = _save_step_file(out_dir, pid, step["label"], resp, elapsed)
+                with print_lock:
+                    print(f"    → {fname}", flush=True)
+                if not step["independent"]:     # step 0 — keep for chaining
+                    main_session_id = sid
+                    main_line_cursor = cursor
             except Exception as exc:
                 phase1_err[orig_pid] = exc
 
@@ -613,20 +596,12 @@ def review_single_paper(
             f"\n    ERROR on phase-1 step {first_pid}: {phase1_err[first_pid]}",
             file=sys.stderr,
         )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.exit(1)
 
-    for step in sorted(phase1_defs, key=lambda p: p["id"]):
-        pid = step["id"]
-        resp, secs, sess = phase1_ok[pid]
-        if pid == 0:
-            main_session = sess
-        step_results[pid] = (step["label"], resp, secs)
-        fname = _save_step_file(out_dir, pid, step["label"], resp, secs)
-        print(f"    → {fname}")
-
     # ----------------------------------------------------------------
-    # Phase 2 — steps 2 and 3 sequentially on the main session.
-    # The paper is already in context from step 0.
+    # Phase 2 — steps 2 and 3 sequentially, resuming step 0's session.
+    # The paper is already in context; no --add-dir needed.
     # ----------------------------------------------------------------
     print("\n  Phase 2 — running steps [2, 3] sequentially …")
 
@@ -634,11 +609,17 @@ def review_single_paper(
         pid = step["id"]
         print(f"\n    [{pid}/5]  {step['label']} …", flush=True)
         t0 = time.time()
-        response = main_session.send(step["text"])
-        elapsed = time.time() - t0
+
+        _, resp, main_line_cursor, elapsed = run_step_pty(
+            step["text"],
+            session_id=main_session_id,
+            line_cursor=main_line_cursor,
+            model=model,
+        )
+
         print(f"    [{pid}/5]  {step['label']} ✓  time: {elapsed:.1f}s")
-        step_results[pid] = (step["label"], response, elapsed)
-        fname = _save_step_file(out_dir, pid, step["label"], response, elapsed)
+        step_results[pid] = (step["label"], resp, elapsed)
+        fname = _save_step_file(out_dir, pid, step["label"], resp, elapsed)
         print(f"    → {fname}")
 
     # ----------------------------------------------------------------
@@ -678,18 +659,22 @@ def review_single_paper(
     )
 
     print(f"\n    [5/5]  {step5_label} …", flush=True)
-    t0 = time.time()
-    response = main_session.send(step5_text)
-    elapsed = time.time() - t0
-    print(f"    [5/5]  {step5_label} ✓  time: {elapsed:.1f}s")
-    step_results[5] = (step5_label, response, elapsed)
-    fname = _save_step_file(out_dir, 5, step5_label, response, elapsed)
+    _, resp5, main_line_cursor, elapsed5 = run_step_pty(
+        step5_text,
+        session_id=main_session_id,
+        line_cursor=main_line_cursor,
+        model=model,
+    )
+    print(f"    [5/5]  {step5_label} ✓  time: {elapsed5:.1f}s")
+    step_results[5] = (step5_label, resp5, elapsed5)
+    fname = _save_step_file(out_dir, 5, step5_label, resp5, elapsed5)
     print(f"    → {fname}")
 
-    main_session.close()
+    # Cleanup temp dir now that all steps are done
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ----------------------------------------------------------------
-    # Compile, PDF, move paper
+    # Compile full review + PDF
     # ----------------------------------------------------------------
     compiled_md = _compile_and_save(out_dir, pdf_path.stem, conference, step_results)
     pdf_result = try_pdf_convert(compiled_md)
