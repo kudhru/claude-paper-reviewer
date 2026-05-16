@@ -1,43 +1,37 @@
 #!/usr/bin/env python3
 """
-paper_reviewer_v3.py — Paper reviewer using interactive Claude PTY sessions.
+paper_reviewer_v3.py — Paper reviewer using interactive Claude sessions.
 
-Uses genuine interactive Claude sessions (PTY, isatty=True) so reviews draw
-from subscription limits rather than Agent SDK credits.
+Runs Claude as a subprocess with stdout inherited from the parent terminal so
+that isatty(stdout)=True → interactive mode → subscription billing (not API
+credits).  No PTY tricks are needed; the parent terminal's TTY is sufficient.
 
-Key design: pass the prompt as a positional CLI arg so no TUI interaction is
-needed.  Each step is:
+Each step is:
+    claude "prompt" --model M [--resume session_id] [--add-dir dir] --dangerously-skip-permissions
 
-    claude "prompt text" --model M [--resume session_id] [--add-dir dir]
-
-The PTY wrapper ensures isatty=True (subscription billing).  Response
-collection uses ~/.claude/sessions/{pid}.json status monitoring and the
-conversation JSONL at ~/.claude/projects/{cwd}/{session_id}.jsonl.
-
-Architecture mirrors v2 (parallel Phase 1).  No token / cost stats are
-available in interactive mode; wall-clock time per step is reported instead.
+Completion is detected via ~/.claude/sessions/{pid}.json (status → idle).
+The response is read from the conversation JSONL at
+    ~/.claude/projects/{cwd}/{session_id}.jsonl
+After reading, the Claude process is killed (it stays alive waiting for input).
 
 Usage:
-    python paper_reviewer_v3.py
-    python paper_reviewer_v3.py --papers-dir ./papers --conference "ACL 2026"
-    python paper_reviewer_v3.py --paper ./papers/foo.pdf --conference "EMNLP 2026"
+    python3 paper_reviewer_v3.py
+    python3 paper_reviewer_v3.py --paper ./papers/foo.pdf --conference "EMNLP 2026"
+    python3 paper_reviewer_v3.py --papers-dir ./papers --conference "ACL 2026"
 
 Requirements:
     - Claude Code CLI installed and authenticated
-    - Python 3.10+  (stdlib only — no pip installs for Claude interaction)
+    - Python 3.10+  (stdlib only)
+    - Must be run from a real terminal (isatty check)
 """
 
 import argparse
-import fcntl
 import json
 import os
-import pty
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,26 +41,25 @@ from typing import Optional
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PTY + JSONL helpers
+# Session helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 
 
-def _projects_dir() -> str:
-    cwd = os.getcwd()
-    return os.path.expanduser(f"~/.claude/projects/{cwd.replace('/', '-')}")
+def _projects_dir() -> Path:
+    return Path.home() / ".claude" / "projects" / Path.cwd().as_posix().replace("/", "-")
 
 
 def _resolve_session_id(pid: int, timeout: int = 30) -> Optional[str]:
     """Poll ~/.claude/sessions/{pid}.json until sessionId appears."""
-    path = f"{_SESSIONS_DIR}/{pid}.json"
+    path = _SESSIONS_DIR / f"{pid}.json"
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if os.path.exists(path):
+        if path.exists():
             try:
-                with open(path) as f:
-                    sid = json.load(f).get("sessionId")
+                d = json.loads(path.read_text())
+                sid = d.get("sessionId")
                 if sid:
                     return sid
             except (OSError, json.JSONDecodeError):
@@ -75,20 +68,19 @@ def _resolve_session_id(pid: int, timeout: int = 30) -> Optional[str]:
     return None
 
 
-def _get_status(path: str) -> Optional[str]:
+def _get_status(pid: int) -> Optional[str]:
+    path = _SESSIONS_DIR / f"{pid}.json"
     try:
-        with open(path) as f:
-            return json.load(f).get("status")
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return json.loads(path.read_text()).get("status")
+    except (OSError, json.JSONDecodeError):
         return None
 
 
-def _collect_new_text(session_file: str, line_cursor: int) -> tuple[str, int]:
-    """Return (text, new_cursor) for all new assistant blocks since cursor."""
+def _collect_new_text(session_file: Path, line_cursor: int) -> tuple[str, int]:
+    """Return (text, new_cursor) for all new assistant text blocks since cursor."""
     try:
-        with open(session_file) as f:
-            lines = f.readlines()
-    except FileNotFoundError:
+        lines = session_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
         return "", line_cursor
 
     texts: list[str] = []
@@ -108,33 +100,21 @@ def _collect_new_text(session_file: str, line_cursor: int) -> tuple[str, int]:
     return "\n\n".join(texts), new_cursor
 
 
-def _kill_wait(pid: int, master_fd: int) -> None:
-    try:
-        os.kill(pid, 9)
-        os.waitpid(pid, 0)
-    except OSError:
-        pass
-    try:
-        os.close(master_fd)
-    except OSError:
-        pass
-
-
-def run_step_pty(
+def run_step(
     prompt: str,
     session_id: Optional[str],
     line_cursor: int,
     model: str,
     extra_dirs: Optional[list] = None,
     timeout: int = 3600,
+    poll_interval: float = 1.0,
 ) -> tuple[str, str, int, float]:
     """
-    Run one review step as an interactive Claude PTY session.
+    Run one review step as an interactive Claude subprocess.
 
-    The prompt is the first positional arg to `claude`, so no TUI interaction
-    is needed — Claude reads it immediately on startup:
-
-        claude "prompt" --model M [--resume sid] [--add-dir dir …]
+    stdout is inherited from the parent terminal (isatty=True → subscription
+    billing).  Completion is detected via the session status file; the process
+    is killed once the response is collected.
 
     Returns (session_id, response, new_line_cursor, duration_s).
     """
@@ -146,43 +126,16 @@ def run_step_pty(
             cmd += ["--add-dir", d]
 
     t0 = time.time()
-    master_fd, slave_fd = pty.openpty()
-    winsize = struct.pack("HHHH", 50, 220, 0, 0)
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
-    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
-
-    pid = os.fork()
-    if pid == 0:                        # child: become Claude
-        os.close(master_fd)
-        os.setsid()
-        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-        os.dup2(slave_fd, 0)
-        os.dup2(slave_fd, 1)
-        os.dup2(slave_fd, 2)
-        os.close(slave_fd)
-        os.execvp(cmd[0], cmd)
-        os._exit(1)
-
-    os.close(slave_fd)
-
-    # Background thread: drain PTY master so Claude never blocks on stdout
-    _stop_drain = threading.Event()
-
-    def _drain() -> None:
-        import select as _select
-        while not _stop_drain.is_set():
-            try:
-                r, _, _ = _select.select([master_fd], [], [], 0.5)
-                if r:
-                    os.read(master_fd, 4096)
-            except OSError:
-                break
-
-    drain_thread = threading.Thread(target=_drain, daemon=True)
-    drain_thread.start()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=sys.stdout,        # inherit terminal TTY → interactive mode
+        stderr=sys.stderr,
+        stdin=subprocess.DEVNULL, # no interactive input
+    )
+    pid = proc.pid
 
     try:
-        # Resolve session ID — status file appears once Claude starts
+        # Resolve session ID
         if session_id is None:
             resolved_sid = _resolve_session_id(pid)
             if not resolved_sid:
@@ -190,15 +143,14 @@ def run_step_pty(
         else:
             resolved_sid = session_id
 
-        session_file = f"{_projects_dir()}/{resolved_sid}.jsonl"
-        status_path = f"{_SESSIONS_DIR}/{pid}.json"
+        session_file = _projects_dir() / f"{resolved_sid}.jsonl"
         deadline = time.time() + timeout
         FLUSH_BUFFER = 2.0
 
         # Phase 1: wait until Claude starts processing (leaves idle)
         while time.time() < deadline:
-            time.sleep(0.5)
-            status = _get_status(status_path)
+            time.sleep(poll_interval)
+            status = _get_status(pid)
             if status is not None and status != "idle":
                 break
 
@@ -206,8 +158,8 @@ def run_step_pty(
         response = ""
         new_cursor = line_cursor
         while time.time() < deadline:
-            time.sleep(0.5)
-            if _get_status(status_path) == "idle":
+            time.sleep(poll_interval)
+            if _get_status(pid) == "idle":
                 time.sleep(FLUSH_BUFFER)
                 response, new_cursor = _collect_new_text(session_file, line_cursor)
                 break
@@ -215,9 +167,8 @@ def run_step_pty(
             response, new_cursor = _collect_new_text(session_file, line_cursor)
 
     finally:
-        _stop_drain.set()
-        _kill_wait(pid, master_fd)
-        drain_thread.join(timeout=2)
+        proc.kill()
+        proc.wait()
 
     return resolved_sid, response, new_cursor, time.time() - t0
 
@@ -253,7 +204,7 @@ PROMPTS = [
             "Explain this paper in detail. Give easy-to-understand intuition as well "
             "for the proposed components in the paper."
         ),
-        "independent": True,    # isolated: long output excluded from review chain
+        "independent": True,
     },
     {
         "id": 2,
@@ -294,7 +245,7 @@ PROMPTS = [
             "and compared with all existing work properly, especially works that are "
             "highly related to this work."
         ),
-        "independent": True,    # isolated: raw web content excluded from step 5
+        "independent": True,
     },
 ]
 
@@ -483,7 +434,7 @@ def _compile_and_save(
     out_dir: Path,
     paper_stem: str,
     conference: str,
-    step_results: dict,     # {pid: (label, response, duration_s)}
+    step_results: dict,
 ) -> Path:
     paper_title = paper_stem.replace("_", " ").replace("-", " ").title()
     sections = [f"# Full Review: {paper_title}\n\n**Conference:** {conference}"]
@@ -537,12 +488,15 @@ def review_single_paper(
         )
 
     # ----------------------------------------------------------------
-    # Phase 1 — steps 0, 1, 4 in parallel, each in its own PTY session.
-    # Step 0's session ID is kept for chained steps 2, 3, 5.
+    # Phase 1 — steps 0, 1, 4 in parallel, each a fresh Claude session.
+    # Step 0's session is kept for chained steps 2, 3, 5.
+    # Note: all three share the parent terminal's stdout — output is
+    # interleaved on screen but responses are captured via JSONL.
     # ----------------------------------------------------------------
     print("\n  Phase 1 — running steps [0, 1, 4] in parallel …")
 
     phase1_defs = [p for p in PROMPTS if p["id"] in {0, 1, 4}]
+    step_defs_by_id = {s["id"]: s for s in phase1_defs}
 
     def _run_phase1(step: dict) -> tuple[int, str, str, int, float]:
         pid = step["id"]
@@ -550,7 +504,7 @@ def review_single_paper(
         with print_lock:
             print(f"    [{pid}/5]  {step['label']} … started", flush=True)
 
-        sid, resp, cursor, elapsed = run_step_pty(
+        sid, resp, cursor, elapsed = run_step(
             full_prompt,
             session_id=None,
             line_cursor=0,
@@ -563,10 +517,7 @@ def review_single_paper(
 
         return pid, sid, resp, cursor, elapsed
 
-    phase1_ok: dict[int, tuple] = {}
     phase1_err: dict[int, Exception] = {}
-
-    step_defs_by_id = {s["id"]: s for s in phase1_defs}
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
@@ -577,14 +528,13 @@ def review_single_paper(
             orig_pid = futures[future]
             try:
                 pid, sid, resp, cursor, elapsed = future.result()
-                phase1_ok[pid] = (sid, resp, cursor, elapsed)
-                # Save the file immediately — don't wait for all 3 to finish
+                # Save immediately — don't wait for all 3 to finish
                 step = step_defs_by_id[pid]
                 step_results[pid] = (step["label"], resp, elapsed)
                 fname = _save_step_file(out_dir, pid, step["label"], resp, elapsed)
                 with print_lock:
                     print(f"    → {fname}", flush=True)
-                if not step["independent"]:     # step 0 — keep for chaining
+                if not step["independent"]:     # step 0
                     main_session_id = sid
                     main_line_cursor = cursor
             except Exception as exc:
@@ -601,16 +551,14 @@ def review_single_paper(
 
     # ----------------------------------------------------------------
     # Phase 2 — steps 2 and 3 sequentially, resuming step 0's session.
-    # The paper is already in context; no --add-dir needed.
     # ----------------------------------------------------------------
     print("\n  Phase 2 — running steps [2, 3] sequentially …")
 
     for step in [p for p in PROMPTS if p["id"] in {2, 3}]:
         pid = step["id"]
         print(f"\n    [{pid}/5]  {step['label']} …", flush=True)
-        t0 = time.time()
 
-        _, resp, main_line_cursor, elapsed = run_step_pty(
+        _, resp, main_line_cursor, elapsed = run_step(
             step["text"],
             session_id=main_session_id,
             line_cursor=main_line_cursor,
@@ -659,7 +607,7 @@ def review_single_paper(
     )
 
     print(f"\n    [5/5]  {step5_label} …", flush=True)
-    _, resp5, main_line_cursor, elapsed5 = run_step_pty(
+    _, resp5, main_line_cursor, elapsed5 = run_step(
         step5_text,
         session_id=main_session_id,
         line_cursor=main_line_cursor,
@@ -670,7 +618,6 @@ def review_single_paper(
     fname = _save_step_file(out_dir, 5, step5_label, resp5, elapsed5)
     print(f"    → {fname}")
 
-    # Cleanup temp dir now that all steps are done
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ----------------------------------------------------------------
@@ -693,7 +640,7 @@ def review_single_paper(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Interactive / batch modes — same UX as v2
+# Interactive / batch modes
 # ──────────────────────────────────────────────────────────────────────────────
 
 def interactive_mode(reviews_dir: Path, model: str) -> None:
@@ -740,7 +687,7 @@ def _run_batch(papers: list, conference: str, reviews_dir: Path, model: str) -> 
         print(f"\n{'=' * 64}")
         print(f"  Paper      : {pdf.name}")
         print(f"  Conference : {conference}")
-        print(f"  Mode       : Interactive PTY (v3)")
+        print(f"  Mode       : Interactive subprocess (v3)")
         print("=" * 64)
         review_single_paper(pdf, conference, reviews_dir, model)
 
@@ -753,19 +700,26 @@ def _run_batch(papers: list, conference: str, reviews_dir: Path, model: str) -> 
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if not os.isatty(sys.stdout.fileno()):
+        sys.exit(
+            "Error: paper_reviewer_v3.py must be run from a real terminal.\n"
+            "stdout is not a TTY — Claude would run non-interactively (API credits).\n"
+            "Use v2 (paper_reviewer_v2.py) for non-TTY / piped usage."
+        )
+
     parser = argparse.ArgumentParser(
-        description="Review academic papers with interactive Claude PTY sessions (v3).",
+        description="Review academic papers with interactive Claude sessions (v3).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python paper_reviewer_v3.py\n"
-            "  python paper_reviewer_v3.py --papers-dir ./papers --conference 'ACL 2026'\n"
-            "  python paper_reviewer_v3.py --paper ./papers/foo.pdf --conference 'EMNLP 2026'\n"
+            "  python3 paper_reviewer_v3.py\n"
+            "  python3 paper_reviewer_v3.py --paper ./papers/foo.pdf --conference 'EMNLP 2026'\n"
+            "  python3 paper_reviewer_v3.py --papers-dir ./papers --conference 'ACL 2026'\n"
         ),
     )
     parser.add_argument("--paper",       metavar="FILE", help="Single PDF to review")
-    parser.add_argument("--papers-dir",  metavar="DIR",  help="Directory of PDFs (all reviewed)")
-    parser.add_argument("--conference",  metavar="NAME", help="Conference / venue (e.g. 'ACL 2026')")
+    parser.add_argument("--papers-dir",  metavar="DIR",  help="Directory of PDFs")
+    parser.add_argument("--conference",  metavar="NAME", help="Conference / venue")
     parser.add_argument("--reviews-dir", metavar="DIR",  default="reviews",
                         help="Root output directory (default: ./reviews)")
     parser.add_argument("--model",       default="claude-sonnet-4-6",
@@ -786,7 +740,7 @@ def main() -> None:
         print(f"\n{'=' * 64}")
         print(f"  Paper      : {pdf.name}")
         print(f"  Conference : {conference}")
-        print(f"  Mode       : Interactive PTY (v3)")
+        print(f"  Mode       : Interactive subprocess (v3)")
         print("=" * 64)
         review_single_paper(pdf, conference, reviews_dir, model)
         print(f"\n{'=' * 64}")
