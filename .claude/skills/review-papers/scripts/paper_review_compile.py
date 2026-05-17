@@ -253,6 +253,8 @@ def main() -> None:
                         help="PDF filename without the .pdf extension")
     parser.add_argument("--conference", required=True, metavar="NAME",
                         help="Conference or venue name (e.g. 'ACL 2026')")
+    parser.add_argument("--pdf-path", metavar="FILE", default=None,
+                        help="Source PDF to move into OUT_DIR after compiling")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).resolve()
@@ -268,6 +270,14 @@ def main() -> None:
         print(f"  PDF      : {pdf.name}")
     else:
         print("  PDF      : skipped (Chrome and weasyprint both unavailable)")
+
+    if args.pdf_path:
+        import shutil
+        src = Path(args.pdf_path).resolve()
+        if src.exists():
+            dest = out_dir / src.name
+            shutil.move(str(src), str(dest))
+            print(f"  Moved    : {src} -> {dest}")
 
 
 if __name__ == "__main__":

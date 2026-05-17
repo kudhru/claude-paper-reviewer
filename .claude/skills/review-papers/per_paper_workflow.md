@@ -195,7 +195,8 @@ Run this Bash command:
 python3 "{COMPILE_SCRIPT}" \
     --out-dir "{OUT_DIR}" \
     --paper-stem "{PAPER_STEM}" \
-    --conference "{CONFERENCE}"
+    --conference "{CONFERENCE}" \
+    --pdf-path "{PDF_PATH}"
 ```
 
 This assembles all step files (skipping steps 0 and 1) into `{OUT_DIR}/full_review.md` and attempts PDF conversion via Chrome headless (primary) or weasyprint (fallback).
