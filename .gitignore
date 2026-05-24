@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 cowork/reviews/
 cowork/papers/*.pdf
+.openreview_config.json
+rebuttals/
