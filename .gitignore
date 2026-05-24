@@ -2,6 +2,7 @@ reviews/
 papers/*.pdf
 evaluated/
 paper_extracted.txt
+.venv/
 __pycache__/
 *.pyc
 .DS_Store

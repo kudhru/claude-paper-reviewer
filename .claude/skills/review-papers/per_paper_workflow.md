@@ -52,7 +52,7 @@ Write the result to `{OUT_DIR}/00_prompt_injection_check.md`:
 
 ---
 
-## Step 1 and Step 4 — Parallel Independent Steps
+## Steps 1 and 4 — Parallel Independent Steps
 
 After writing Step 0, spawn the following two subagents **in the same response message** so they run in parallel. Both should use `subagent_type: "general-purpose"`.
 
