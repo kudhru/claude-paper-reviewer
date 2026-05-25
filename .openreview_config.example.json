@@ -1,0 +1,5 @@
+{
+  "username": "your-email@example.com",
+  "password": "your-password",
+  "baseurl": "https://api2.openreview.net"
+}
