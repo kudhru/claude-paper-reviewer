@@ -9,4 +9,25 @@ __pycache__/
 cowork/reviews/
 cowork/papers/*.pdf
 .openreview_config.json
+.hotcrp_config.json
+hotcrp-data/
+openreview-data/
+openreview-reviewer-data/
 rebuttals/
+
+# Confidential / working data — manuscripts under review, unpublished drafts,
+# per-paper review notes and personal reports. Never commit.
+papers_checked_for_hallucinations/
+papers_to_be_submitted/
+metadata-review/
+acceptance-reports/
+achievement-reports/
+# Stray packaged-skill archives
+.claude/skills/*.zip
+
+# Pangram API key (never commit) and the confidential review files dropped in to check
+.env
+.claude/skills/*/.env
+pangram_to_check/*
+!pangram_to_check/README.md
+*.pangram.md
