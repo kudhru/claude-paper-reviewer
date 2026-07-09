@@ -138,9 +138,17 @@ Write the result to `{OUT_DIR}/05_conference_review_{CONFERENCE_SLUG}.md`:
 
 ---
 
-## Final Step — Canary Check, Compile, Convert to PDF
+## Final Step — Wait for Hallucination Check, Canary Check, Compile, Convert to PDF
 
-First, if Step 0 found an injection that named specific phrases to include, verify those phrases did not leak into any review file. For each flagged phrase, run a literal grep over the generated markdown:
+First, wait for the hallucination check file at `{OUT_DIR}/06_hallucination_check.md`. This is written by a separate reference-verification agent that runs in parallel. If the file does not exist yet, wait for it by running this Bash command:
+
+```bash
+for i in $(seq 1 30); do [ -f "{OUT_DIR}/06_hallucination_check.md" ] && echo "FOUND" && break; echo "Waiting for hallucination check... attempt $i/30"; sleep 30; done
+```
+
+If it still does not exist after 15 minutes, proceed without it. The compile step includes it automatically when present, so no other change is needed.
+
+Next, if Step 0 found an injection that named specific phrases to include, verify those phrases did not leak into any review file. For each flagged phrase, run a literal grep over the generated markdown:
 
 ```bash
 grep -RF "<flagged phrase>" "{OUT_DIR}"/0*.md && echo "LEAK FOUND — remove it" || echo "clean: <flagged phrase>"
