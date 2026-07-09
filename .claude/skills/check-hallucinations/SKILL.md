@@ -1,6 +1,6 @@
 ---
 name: check-hallucinations
-description: Verify that all references cited in a research paper actually exist by searching the web. Flags hallucinated, incomplete, or mismatched references.
+description: Verify that all references cited in a research paper exist AND that their cited metadata (title, authors, venue, year, identifier) matches the real published record. Flags hallucinated, incomplete, malformed, and truncated-author references.
 argument-hint: [--paper FILE | --papers-dir DIR] [--out-dir DIR]
 disable-model-invocation: true
 allowed-tools: Bash(find *) Bash(ls *) Bash(pwd) Bash(realpath *) Bash(mkdir *) Bash(date *)
@@ -13,7 +13,9 @@ allowed-tools: Bash(find *) Bash(ls *) Bash(pwd) Bash(realpath *) Bash(mkdir *) 
 **Default papers dir:** !`cd "${CLAUDE_SKILL_DIR}/../../.." && echo "$(pwd)/papers_to_be_checked_for_hallucinations"`
 **Default output dir:** !`cd "${CLAUDE_SKILL_DIR}/../../.." && echo "$(pwd)/papers_checked_for_hallucinations"`
 
-Verify that references in one or more research papers actually exist. Your only job in this session is orchestration -- finding PDFs, creating output directories, and spawning agents. All verification happens inside agents.
+Verify that references in one or more research papers exist and are cited correctly against their canonical records. Your only job in this session is orchestration -- finding PDFs, creating output directories, and spawning agents. All verification happens inside agents.
+
+Each run produces a fresh, independent report. The check does not carry state between runs. Re-run it whenever the paper changes.
 
 ## Arguments
 
@@ -47,8 +49,9 @@ If `--out-dir` is not given, use the **Default output dir** shown above.
    - Create `PAPER_OUT_DIR` with `mkdir -p`
 
 6. **Spawn agents in batches of 5 papers** -- process papers in batches of up to 5. For each batch:
-   - For each paper in the batch, fill in the template variables (`{PDF_PATH}`, `{OUT_DIR}`, `{COMPILE_SCRIPT}`) in the workflow template, then spawn one `general-purpose` Agent per paper.
+   - For each paper in the batch, fill in the template variables (`{PDF_PATH}`, `{OUT_DIR}`, `{REPORT_FILENAME}`, `{COMPILE_SCRIPT}`) in the workflow template, then spawn one `general-purpose` Agent per paper.
    - `{OUT_DIR}` is the per-paper `PAPER_OUT_DIR` (not the root output dir).
+   - `{REPORT_FILENAME}` is `hallucination_check.md`.
    - `{COMPILE_SCRIPT}` is the absolute path to the **Compile script** shown above.
    - Issue ALL Agent calls for the batch in a single response message so they run in parallel.
    - Wait for all agents in the batch to complete before starting the next batch.
