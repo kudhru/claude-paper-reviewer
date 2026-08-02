@@ -20,7 +20,7 @@ Apply these to everything you write:
 
 ## Tool Restrictions
 
-Use `Read` to read the paper PDF. Use `WebSearch` to find candidate records and `WebFetch` to open the canonical record page and read its real title and full author list. Use `Write` to write the output report. Use `Bash` only for the final compile step. Do NOT use Agent tools. Do not spawn subagents.
+Use `Read` to read the paper PDF. Use `WebSearch` to find candidate records and `WebFetch` to open the canonical record page and read its real title and full author list. This means an ordinary search query followed by opening the page a human would land on, never a call against DBLP's, ACL Anthology's, OpenReview's, or any other site's API or bulk-export endpoint, and never crawling their databases. Use `Write` to write the output report. Use `Bash` only for the final compile step. Do NOT use Agent tools. Do not spawn subagents.
 
 Key principle. A web search result title in a snippet is not enough to VERIFY a reference. You must open the canonical record (the arXiv abstract page, the ACL Anthology page, the DOI or publisher page, or a library catalog for books) and compare fields against the citation. Existence is necessary but not sufficient. Metadata must match.
 
@@ -63,7 +63,8 @@ For every reference that is not INCOMPLETE, do the following.
 1. Search with the title in quotes plus the first author's last name using `WebSearch`.
 2. If an arXiv ID or DOI is present, treat it as a lead but not as proof. Open it directly with `WebFetch` (for arXiv use the abstract page `https://arxiv.org/abs/<id>`; for a DOI use the resolver). Confirm the page you land on is actually the cited work.
 3. Open the best candidate's canonical page with `WebFetch` (arXiv abstract page, ACL Anthology page, publisher page, DOI record, or dblp). Read the real title and the FULL author list from that page. For books, use a library catalog, the publisher page, or archive.org.
-4. If two searches and an identifier lookup all fail to surface any matching work, classify the reference as **NOT FOUND** and move on.
+4. If the reference cites the work only as an arXiv preprint (or another non-peer-reviewed venue, such as a technical report or a workshop version), check whether it has since been formally published elsewhere. On the arXiv abstract page, read the "Journal reference" and "Comments" fields for an acceptance note (for example "Accepted to ACL 2024" or "To appear in NeurIPS 2024"). If neither field mentions a venue, run one more `WebSearch` for the title plus terms like "proceedings", "ACL Anthology", or "dblp", then open the top matching result with `WebFetch` (a DBLP, ACL Anthology, OpenReview, or publisher page). This is a plain search-and-open, the same as any other lookup in this workflow, not a query against DBLP's, ACL Anthology's, or OpenReview's API and not a crawl of their databases. If nothing turns up after one such search, treat the arXiv version as the only known publication and do not flag it. A DBLP entry for the same title listing a conference or journal venue confirms the paper has been published.
+5. If two searches and an identifier lookup all fail to surface any matching work, classify the reference as **NOT FOUND** and move on.
 
 ### Step 3.2 Compare fields against the canonical record
 Compare each field and record every discrepancy.
@@ -71,7 +72,7 @@ Compare each field and record every discrepancy.
 - **Title.** Normalize case and punctuation, then compare content words. A pure function-word or casing or hyphenation difference is acceptable. A different or invented subtitle, a changed distinctive term, or a reworded claim is a **title mismatch**. Record the cited title and the real title.
 - **Authors.** Compare each explicitly named author to the real author list. If any named author is not on the real paper, or the lead authors differ, it is an **author mismatch**. Record which names are wrong and the real lead authors.
 - **Truncation.** If the entry carries an author placeholder, compare the implied count to the real total. Flag a **truncation error** when the placeholder materially understates the real author count. For example, "and 1 others" after six named authors implies seven authors. If the real paper has 51, that hides 45 co-authors and is a truncation error. Record the real total.
-- **Venue.** If the cited venue differs from the real one (for example a workshop cited as the main conference, or the wrong conference), it is a **venue mismatch**. A preprint cited as arXiv when a later peer-reviewed version exists is acceptable, note it but do not flag it.
+- **Venue.** If the cited venue differs from the real one (for example a workshop cited as the main conference, or the wrong conference), it is a **venue mismatch**. This also applies when a reference cites a work only as an arXiv preprint (or another non-peer-reviewed version) but the work has since been formally published at a conference, journal, or workshop, as found via the arXiv page's "Journal reference"/"Comments" field, DBLP, ACL Anthology, OpenReview, or the publisher's page. Treat this as a **venue mismatch** too, the citation should point to the original publication venue, not the superseded preprint. Record the real venue (name and year, plus a proceedings link if available) so the citation can be corrected. Only skip this flag when the work is a genuine preprint with no peer-reviewed publication yet.
 - **Year.** If the cited year differs from the real publication year, it is a **year mismatch**. For a preprint, the arXiv year is acceptable.
 - **Identifier.** If an arXiv ID or DOI is present, confirm it resolves to THIS work (matching real title and first author). If it resolves to a different paper, or does not resolve, it is an **identifier mismatch**. Also sanity-check plausibility: an arXiv ID encodes year and month as YYMM. If that month is in the future relative to today, flag it for manual review rather than auto-passing. A recent but genuine ID that resolves correctly is fine.
 
@@ -152,6 +153,7 @@ Every row must carry a canonical source URL where one exists, including VERIFIED
 - Year cited: {...} | Year real: {...}
 - Identifier cited: {...} | Resolves to: {...}
 **Canonical source:** {URL}
+{If the venue mismatch is a superseded arXiv preprint, add: **Action:** Cite the published version at {real venue}, {real year}, not the arXiv preprint.}
 
 ## Not Found References
 
@@ -175,7 +177,7 @@ Every row must carry a canonical source URL where one exists, including VERIFIED
 
 ## Methodology Note
 
-Each reference was checked against its canonical record (arXiv, ACL Anthology, DOI or publisher page, or a library catalog for books), not by title existence alone. VERIFIED means the cited title, authors, venue, year, and identifier all match the real record. MALFORMED means the work is real but at least one cited field is wrong, including author lists truncated by a placeholder that hides many co-authors. NOT FOUND is a flag for manual review, not definitive proof of fabrication. Limitations: anonymized submissions, some regional books, and paywalled records may be UNVERIFIABLE even when genuine.
+Each reference was checked against its canonical record (arXiv, ACL Anthology, DOI or publisher page, or a library catalog for books), not by title existence alone. VERIFIED means the cited title, authors, venue, year, and identifier all match the real record. MALFORMED means the work is real but at least one cited field is wrong, including author lists truncated by a placeholder that hides many co-authors, and citations to an arXiv preprint when the work has since been formally published at a conference, journal, or workshop (the citation should point to that published venue, not the preprint). NOT FOUND is a flag for manual review, not definitive proof of fabrication. Limitations: anonymized submissions, some regional books, and paywalled records may be UNVERIFIABLE even when genuine.
 ```
 
 ## Phase 7 -- Compile and Move PDF
