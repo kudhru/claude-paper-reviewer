@@ -124,14 +124,22 @@ def _user_id(client) -> str:
 # --------------------------------------------------------------------------- #
 
 # Role suffixes that sit directly under a venue id; strip them to get the venue.
+# Most venues call the reviewer role "Reviewers". Some (e.g. AAAI) call it
+# "Program_Committee" instead, with per-paper groups shaped the same way
+# (Submission{N}/Program_Committee, and an anonymized Program_Committee_{code}).
 _ROLE_SUFFIXES = (
     "/Reviewers/Invited",
     "/Reviewers",
     "/Reviewer",
+    "/Program_Committee/Invited",
+    "/Program_Committee",
     "/Area_Chairs",
     "/Senior_Area_Chairs",
     "/Program_Chairs",
 )
+
+# Per-paper reviewer-role group name fragments, tried in this order.
+_REVIEWER_ROLE_NAMES = ("Reviewer", "Program_Committee")
 
 
 def _normalize_venue(raw: str) -> str:
@@ -141,6 +149,8 @@ def _normalize_venue(raw: str) -> str:
     if not s:
         return s
     # Full URL: https://openreview.net/group?id=CAISc/2026/Conference/Reviewers
+    # (may carry a trailing UI fragment like #assigned-submissions; drop it first)
+    s = s.split("#", 1)[0]
     m = re.search(r"[?&]id=([^&]+)", s)
     if m:
         from urllib.parse import unquote
@@ -381,7 +391,8 @@ def _member_groups(client, uid: str) -> list:
 
 def _assignment_numbers_from_groups(venue: str, member_groups: list) -> set:
     """Submission numbers for which the user is in a per-paper reviewer group."""
-    pat = re.compile(rf"^{re.escape(venue)}/(?:Submission|Paper)(\d+)/Reviewer")
+    role = "|".join(_REVIEWER_ROLE_NAMES)
+    pat = re.compile(rf"^{re.escape(venue)}/(?:Submission|Paper)(\d+)/(?:{role})")
     nums = set()
     for gid in member_groups:
         m = pat.match(gid)
@@ -392,7 +403,8 @@ def _assignment_numbers_from_groups(venue: str, member_groups: list) -> set:
 
 def _my_anon_groups(venue: str, member_groups: list) -> set:
     """The user's anonymized per-paper reviewer groups (sign your own reviews)."""
-    pat = re.compile(rf"^{re.escape(venue)}/(?:Submission|Paper)\d+/Reviewer_")
+    role = "|".join(_REVIEWER_ROLE_NAMES)
+    pat = re.compile(rf"^{re.escape(venue)}/(?:Submission|Paper)\d+/(?:{role})_")
     return {gid for gid in member_groups if pat.match(gid)}
 
 
@@ -402,6 +414,8 @@ def _assignment_note_ids_from_edges(client, venue: str, uid: str) -> set:
     for inv in (
         f"{venue}/Reviewers/-/Assignment",
         f"{venue}/Reviewers/-/Paper_Assignment",
+        f"{venue}/Program_Committee/-/Assignment",
+        f"{venue}/Program_Committee/-/Paper_Assignment",
     ):
         try:
             edges = client.get_all_edges(invitation=inv, tail=uid)
@@ -475,8 +489,8 @@ def cmd_list_venues(args):
 
     member_groups = _member_groups(client, uid)
 
-    # A venue is the prefix of any '*/Reviewers' group that is NOT per-paper.
-    venue_re = re.compile(r"^(.*)/Reviewers$")
+    # A venue is the prefix of any top-level reviewer-role group that is NOT per-paper.
+    venue_re = re.compile(r"^(.*)/(?:Reviewers|Program_Committee)$")
     venues = {}
     for gid in member_groups:
         if "/Submission" in gid or "/Paper" in gid:
