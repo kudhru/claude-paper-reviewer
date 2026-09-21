@@ -77,10 +77,10 @@ def _classify_reply(note) -> str:
         return "meta_review"
     if "Ethics_Review" in inv_str:
         return "ethics_review"
+    if "Author_Response" in inv_str or "Rebuttal" in inv_str:
+        return "author_response"
     if "Official_Review" in inv_str:
         return "official_review"
-    if "Rebuttal" in inv_str:
-        return "author_response"
     if "Official_Comment" in inv_str:
         return "comment"
     if "Public_Comment" in inv_str:
@@ -234,7 +234,29 @@ def _format_generic(data: dict, label: str, index: int) -> str:
     return "\n".join(lines)
 
 
+def _clear_stale_typed_files(paper_dir: Path):
+    patterns = [
+        "review_*.txt",
+        "meta_review.txt",
+        "meta_review_*.txt",
+        "decision.txt",
+        "decision_*.txt",
+        "ethics_review.txt",
+        "ethics_review_*.txt",
+        "author_response.txt",
+        "author_response_*.txt",
+        "comment_*.txt",
+        "public_comment_*.txt",
+        "other_*.txt",
+    ]
+    for pattern in patterns:
+        for f in paper_dir.glob(pattern):
+            f.unlink()
+
+
 def _write_typed_files(paper_dir: Path, categorized: dict):
+    _clear_stale_typed_files(paper_dir)
+
     for i, rev in enumerate(categorized["official_review"], 1):
         text = _format_official_review(rev, i)
         (paper_dir / f"review_{i}.txt").write_text(text, encoding="utf-8")
