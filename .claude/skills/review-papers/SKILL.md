@@ -1,6 +1,6 @@
 ---
 name: review-papers
-description: Review one or more research papers through a structured multi-step pipeline. Each paper gets three focused agents that run in parallel.
+description: Review one or more research papers through a structured multi-step pipeline. Each paper gets four focused agents that run in parallel.
 argument-hint: [--paper FILE | --papers-dir DIR] --conference "NAME" [--reviews-dir DIR]
 disable-model-invocation: true
 allowed-tools: Bash(find *) Bash(ls *) Bash(pwd) Bash(realpath *) Bash(mkdir *) Bash(date *)

@@ -13,6 +13,8 @@ cowork/papers/*.pdf
 hotcrp-data/
 openreview-data/
 openreview-reviewer-data/
+openreview-chair-data/
+openreview-chair-data_refresh/
 rebuttals/
 
 # Confidential / working data — manuscripts under review, unpublished drafts,
